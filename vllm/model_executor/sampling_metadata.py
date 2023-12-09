@@ -32,6 +32,12 @@ class SamplingMetadata:
         selected_token_indices: torch.Tensor,
         categorized_sample_indices: Optional[Dict[SamplingType, torch.Tensor]],
         perform_sampling: bool = True,
+        use_speculate: Optional[bool] = False,
+        is_multi_query_mode: Optional[bool] = False,
+        speculate_length: Optional[int] = None,
+        input_token_ids: Optional[torch.Tensor] = None,
+        draft_token_ids: Optional[torch.Tensor] = None,
+        draft_token_probs: Optional[torch.Tensor] = None,
     ) -> None:
         self.seq_groups = seq_groups
         self.seq_data = seq_data
@@ -39,6 +45,12 @@ class SamplingMetadata:
         self.selected_token_indices = selected_token_indices
         self.categorized_sample_indices = categorized_sample_indices
         self.perform_sampling = perform_sampling
+        self.use_speculate = use_speculate
+        self.is_multi_query_mode = is_multi_query_mode
+        self.speculate_length = speculate_length
+        self.input_token_ids = input_token_ids
+        self.draft_token_ids = draft_token_ids
+        self.draft_token_probs = draft_token_probs
 
         self.num_prompts = len(prompt_lens) if prompt_lens is not None else 0
 
@@ -125,7 +137,10 @@ class SamplingTensors:
             for seq_id in seq_ids:
                 seq_data = sampling_metadata.seq_data[seq_id]
                 prompt_tokens.append(seq_data.prompt_token_ids)
-                output_tokens.append(seq_data.output_token_ids)
+                # Note: For the case of speculative decoding, we need to apply penalties for the
+                # draft tokens as well.
+                output_tokens.append(seq_data.output_token_ids +
+                                     seq_data.get_draft_token_ids())
             temperatures += [temperature] * len(seq_ids)
             top_ps += [top_p] * len(seq_ids)
             top_ks += [top_k] * len(seq_ids)
