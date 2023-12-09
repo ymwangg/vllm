@@ -39,7 +39,9 @@ def get_attn_backend(
         from vllm.attention.backends.blocksparse_attn import (
             BlocksparseFlashAttentionBackend)
         return BlocksparseFlashAttentionBackend
-
+    logger.info("Using SpeculateAttn backend.")
+    from vllm.attention.backends.speculate_attn import SpeculateAttnBackend
+    return SpeculateAttnBackend
     backend = which_attn_to_use(num_heads, head_size, num_kv_heads,
                                 sliding_window, dtype, kv_cache_dtype,
                                 block_size)

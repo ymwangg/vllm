@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch.distributed import Backend, ProcessGroup
+import enum
 
 import vllm.envs as envs
 from vllm.logger import init_logger
@@ -36,6 +37,14 @@ from vllm.logger import init_logger
 @dataclass
 class GraphCaptureContext:
     stream: torch.cuda.Stream
+
+class ActiveModel(enum.Enum):
+    TARGET = enum.auto()
+    DRAFT = enum.auto()
+
+
+# Draft model tensor parallel size for speculative decoding
+_DRAFT_MODEL_TP_SIZE = None
 
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
@@ -562,10 +571,32 @@ def init_distributed_environment(
             "world group already initialized with a different world size")
 
 
+_ACTIVE_MODEL: ActiveModel = ActiveModel.TARGET
+
+
+# This context manager is used to mark which model
+# is currently active so that the corresponding distributed group can be selected.
+@contextlib.contextmanager
+def MarkActiveModel(new_value):
+    global _ACTIVE_MODEL
+
+    # Save the original value
+    original_value = _ACTIVE_MODEL
+
+    try:
+        # Temporarily change the global variable
+        _ACTIVE_MODEL = new_value
+        yield
+    finally:
+        # Restore the original value after the block
+        _ACTIVE_MODEL = original_value
+
+
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
     backend: Optional[str] = None,
+    draft_model_tp_size: Optional[int] = None,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -639,11 +670,16 @@ def initialize_model_parallel(
         use_custom_allreduce=_ENABLE_CUSTOM_ALL_REDUCE,
     )
 
+    global _DRAFT_MODEL_TP_SIZE
+    assert _DRAFT_MODEL_TP_SIZE is None, ("draft model tp size is already set")
+    _DRAFT_MODEL_TP_SIZE = draft_model_tp_size
+
 
 def ensure_model_parallel_initialized(
     tensor_model_parallel_size: int,
     pipeline_model_parallel_size: int,
     backend: Optional[str] = None,
+    draft_model_tp_size: Optional[int] = None,
 ) -> None:
     """Helper to initialize model parallel groups if they are not initialized,
     or ensure tensor-parallel and pipeline-parallel sizes are equal to expected
@@ -653,7 +689,8 @@ def ensure_model_parallel_initialized(
         get_world_group().device_group)
     if not model_parallel_is_initialized():
         initialize_model_parallel(tensor_model_parallel_size,
-                                  pipeline_model_parallel_size, backend)
+                                  pipeline_model_parallel_size, backend,
+                                  draft_model_tp_size)
         return
 
     assert (
@@ -676,11 +713,24 @@ def model_parallel_is_initialized():
 def get_tensor_model_parallel_world_size():
     """Return world size for the tensor model parallel group."""
     return get_tp_group().world_size
+    if _ACTIVE_MODEL == ActiveModel.DRAFT:
+        return _DRAFT_MODEL_TP_SIZE
+    return torch.distributed.get_world_size(
+        group=get_tensor_model_parallel_group())
+
+
+def get_pipeline_model_parallel_world_size():
+    """Return world size for the pipeline model parallel group."""
+    return torch.distributed.get_world_size(
+        group=get_pipeline_model_parallel_group())
 
 
 def get_tensor_model_parallel_rank():
     """Return my rank for the tensor model parallel group."""
     return get_tp_group().rank_in_group
+    if _ACTIVE_MODEL == ActiveModel.DRAFT and _DRAFT_MODEL_TP_SIZE == 1:
+        return 0
+    return torch.distributed.get_rank(group=get_tensor_model_parallel_group())
 
 
 def destroy_model_parallel():

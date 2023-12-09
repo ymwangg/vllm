@@ -11,7 +11,7 @@ import torch.nn as nn
 from vllm.attention import AttentionMetadata, get_attn_backend
 from vllm.config import (CacheConfig, DeviceConfig, LoadConfig, LoRAConfig,
                          ModelConfig, ParallelConfig, SchedulerConfig,
-                         VisionLanguageConfig)
+                         VisionLanguageConfig, SpeculativeConfig)
 from vllm.distributed import broadcast_tensor_dict
 from vllm.distributed.parallel_state import graph_capture
 from vllm.logger import init_logger
@@ -23,9 +23,11 @@ from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sampling_params import SamplingParams
-from vllm.sequence import SamplerOutput, SequenceData, SequenceGroupMetadata
+from vllm.sequence import SamplerOutput, SequenceData, SequenceGroupMetadata, SpeculateOutput, SpeculateSequenceGroupOutput
 from vllm.utils import (CudaMemoryProfiler, get_kv_cache_torch_dtype, is_hip,
                         is_pin_memory_available, make_tensor_with_pad)
+from vllm.distributed.communication_op import tensor_model_parallel_all_gather
+from vllm.distributed.parallel_state import MarkActiveModel, ActiveModel
 
 logger = init_logger(__name__)
 
@@ -86,6 +88,8 @@ class ModelRunner:
         kv_cache_dtype: Optional[str] = "auto",
         is_driver_worker: bool = False,
         vision_language_config: Optional[VisionLanguageConfig] = None,
+        rank: int = 0,
+        speculative_config: Optional[SpeculativeConfig] = None,
     ):
         self.model_config = model_config
         self.parallel_config = parallel_config
@@ -142,6 +146,20 @@ class ModelRunner:
         self.flashinfer_workspace_buffer: torch.Tensor
         # Set after load_model.
         self.lora_manager: Optional[LRUCacheWorkerLoRAManager] = None
+        # speculative decoding related variables
+        self.rank = rank
+        self.draft_model: torch.nn.Module  # set after load_model
+        if speculative_config:
+            self.use_speculate = True
+            self.draft_model_config = speculative_config.draft_model_config
+            self.speculate_length = speculative_config.num_speculative_tokens
+        else:
+            self.use_speculate = False
+            self.draft_model_config = None
+            self.speculate_length = None
+
+        self.d_graph_runners: Dict[int, CUDAGraphRunner] = {}
+        self.d_graph_memory_pool = None  # Set during graph capture
 
     def load_model(self) -> None:
         with CudaMemoryProfiler() as m:
@@ -208,6 +226,26 @@ class ModelRunner:
                     "Using FP8 KV cache but no scaling factors "
                     "provided. Defaulting to scaling factors of 1.0. "
                     "This may lead to less accurate results!")
+
+        # Load draft model when enabling speculative decoding
+        if self.use_speculate:
+            with MarkActiveModel(ActiveModel.DRAFT):
+                # NOTE: We use global variable to control parallel state (world size, rank)
+                # of draft model used in speculative decoding.
+                with CudaMemoryProfiler() as m:
+                    self.draft_model = get_model(
+                        model_config=self.draft_model_config,
+                        device_config=self.device_config,
+                        load_config=self.load_config,
+                        lora_config=self.lora_config,
+                        vision_language_config=self.vision_language_config,
+                        parallel_config=self.parallel_config,
+                        scheduler_config=self.scheduler_config,
+                    )
+                self.draft_model_memory_usage = m.consumed_memory
+                logger.info(
+                    f"Loading draft model weights took "
+                    f"{self.draft_model_memory_usage / float(2**30):.4f} GB")
 
     def save_sharded_state(
         self,
@@ -963,6 +1001,543 @@ class ModelRunner:
         elapsed_time = end_time - start_time
         # This usually takes < 10 seconds.
         logger.info("Graph capturing finished in %.0f secs.", elapsed_time)
+
+    @torch.inference_mode()
+    def speculate_capture_model(self, kv_caches: List[torch.Tensor],
+                                d_kv_caches: List[torch.Tensor]) -> None:
+        """Cuda graph capture a model.
+
+        Note that CUDA graph's performance gain is negligible if number
+        of batched tokens are larger than 200. And since CUDA graph
+        requires fixed sized tensors, supporting large/variable batch
+        size requires high GPU memory overhead. Thus, vLLM only captures
+        decoding requests. Mixed batch (chunked prefill + decoding) or
+        prefill requests are not captured.
+
+        Since it is used for decoding-only, it assumes there's only 1 token
+        per sequence in the batch.
+        """
+        assert not self.model_config.enforce_eager
+        logger.info("Capturing the model for CUDA graphs. This may lead to "
+                    "unexpected consequences if the model is not static. To "
+                    "run the model in eager mode, set 'enforce_eager=True' or "
+                    "use '--enforce-eager' in the CLI.")
+        logger.info("CUDA graphs can take additional 1~3 GiB memory per GPU. "
+                    "If you are running out of memory, consider decreasing "
+                    "`gpu_memory_utilization` or enforcing eager mode. "
+                    "You can also reduce the `max_num_seqs` as needed "
+                    "to decrease memory usage.")
+        start_time = time.perf_counter()
+
+        max_batch_size = max(_BATCH_SIZES_TO_CAPTURE)
+        graph_batch_size = _get_graph_batch_size(
+            self.scheduler_config.max_num_seqs)
+        batch_size_capture_list = [
+            bs for bs in _BATCH_SIZES_TO_CAPTURE if bs <= graph_batch_size
+        ]
+
+        def capture_graph_inner(is_draft_model: bool = False,
+                                caches: List[torch.Tensor] = None) -> None:
+            if is_draft_model:
+                seq_len = 1
+                is_multi_query_mode = False
+                active_model = ActiveModel.DRAFT
+                graph_runners = self.d_graph_runners
+                graph_memory_pool = self.d_graph_memory_pool
+            else:
+                seq_len = self.speculate_length + 1
+                is_multi_query_mode = True
+                active_model = ActiveModel.TARGET
+                graph_runners = self.graph_runners
+                graph_memory_pool = self.graph_memory_pool
+
+            # Prepare dummy inputs. These will be reused for all batch sizes.
+            input_tokens = torch.zeros(max_batch_size,
+                                       seq_len,
+                                       dtype=torch.long).cuda()
+            input_positions = torch.zeros(max_batch_size,
+                                          seq_len,
+                                          dtype=torch.long).cuda()
+            slot_mapping = torch.empty(max_batch_size,
+                                       seq_len,
+                                       dtype=torch.long).cuda()
+            slot_mapping.fill_(_PAD_SLOT_ID)
+            context_lens = torch.ones(max_batch_size, dtype=torch.int32).cuda()
+            block_tables = torch.from_numpy(self.graph_block_tables).cuda()
+
+            # NOTE(woosuk): There are 3 backends for all-reduce: custom all-reduce
+            # kernel, CuPy NCCL, and PyTorch NCCL. When using CUDA graph, we use
+            # either custom all-reduce kernel or CuPy NCCL. When not using CUDA
+            # graph, we use either custom all-reduce kernel or PyTorch NCCL.
+            # We always prioritize using custom all-reduce kernel but fall back
+            # to PyTorch or CuPy NCCL if it is disabled or not supported.
+            with graph_capture() as graph_capture_context:
+                # NOTE: Capturing the largest batch size first may help reduce the
+                # memory usage of CUDA graph.
+                for batch_size in reversed(batch_size_capture_list):
+                    # Create dummy attn_metadata.
+                    decode_metadata = self.attn_backend.make_metadata(
+                        is_prompt=False,
+                        seq_lens=None,
+                        seq_lens_tensor=context_lens[:batch_size],
+                        max_query_len=None,
+                        max_seq_len=None,
+                        subquery_start_loc=None,
+                        seq_start_loc=None,
+                        context_lens_tensor=None,
+                        block_tables=block_tables[:batch_size],
+                        use_cuda_graph=True,
+                        real_batch_size=batch_size,
+                        seq_len=input_tokens.shape[1],
+                        is_multi_query_mode=is_multi_query_mode,
+                    )
+                    attn_metadata = AttentionMetadata(
+                        num_prefills=0,
+                        num_prefill_tokens=0,
+                        num_decode_tokens=batch_size,
+                        # NOTE: slot_mapping is 2d, we need to flatten it to
+                        # 1d after slicing.
+                        slot_mapping=slot_mapping[:batch_size].view(-1),
+                        prefill_metadata=None,
+                        decode_metadata=decode_metadata,
+                        kv_cache_dtype=self.kv_cache_dtype,
+                    )
+                    graph_runner = CUDAGraphRunner(self.draft_model) if is_draft_model \
+                        else CUDAGraphRunner(self.model)
+                    with MarkActiveModel(active_model):
+                        graph_runner.capture(
+                            # NOTE: input_tokens and input_positions are 2d, we need to
+                            # flatten them to 1d after slicing.
+                            input_tokens[:batch_size].view(-1),
+                            input_positions[:batch_size].view(-1),
+                            caches,
+                            attn_metadata,
+                            memory_pool=graph_memory_pool,
+                        )
+                    graph_memory_pool = graph_runner.graph.pool()
+                    graph_runners[batch_size] = graph_runner
+                if is_draft_model:
+                    self.d_graph_memory_pool = graph_memory_pool
+                else:
+                    self.graph_memory_pool = graph_memory_pool
+
+        # 1. Capture draft model
+        capture_graph_inner(is_draft_model=True, caches=d_kv_caches)
+        # 2. Capture target model
+        capture_graph_inner(is_draft_model=False, caches=kv_caches)
+
+        end_time = time.perf_counter()
+        elapsed_time = end_time - start_time
+        # This usually takes < 10 seconds.
+        logger.info(f"Graph capturing finished in {elapsed_time:.0f} secs.")
+
+    def _prepare_speculate_decode(
+        self,
+        seq_group_metadata_list: List[SequenceGroupMetadata],
+        is_multi_query_mode: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, AttentionMetadata,
+               SamplingMetadata]:
+        assert len(seq_group_metadata_list) > 0
+        input_tokens: List[List[int]] = []
+        input_positions: List[List[int]] = []
+        slot_mapping: List[List[int]] = []
+        context_lens: List[int] = []
+        block_tables: List[List[int]] = []
+        seq_groups: List[Tuple[List[int], SamplingParams]] = []
+        seq_data_dict: Dict[int, SequenceData] = {}
+
+        for seq_group_metadata in seq_group_metadata_list:
+            assert not seq_group_metadata.is_prompt
+            assert seq_group_metadata.token_chunk_size == 1
+            seq_data_dict.update(seq_group_metadata.seq_data)
+
+            seq_ids = list(seq_group_metadata.seq_data.keys())
+            sampling_params = seq_group_metadata.sampling_params
+            seq_groups.append((seq_ids, sampling_params))
+
+            for seq_id in seq_ids:
+                seq_data = seq_group_metadata.seq_data[seq_id]
+
+                num_generation_tokens = self.speculate_length + 1
+                generation_tokens = [seq_data.get_last_token_id()
+                                     ] + [0] * self.speculate_length
+
+                input_tokens.append(generation_tokens)
+                seq_len = seq_data.get_len() + self.speculate_length
+
+                context_len = seq_len if self.sliding_window is None else min(
+                    seq_len, self.sliding_window)
+                context_lens.append(context_len)
+
+                first_position = seq_len - num_generation_tokens
+                positions = [
+                    first_position + offset
+                    for offset in range(num_generation_tokens)
+                ]
+                input_positions.append(positions)
+
+                block_table = seq_group_metadata.block_tables[seq_id]
+
+                slots = []
+                for position in positions:
+                    block_number = block_table[position // self.block_size]
+                    block_offset = position % self.block_size
+                    slot = block_number * self.block_size + block_offset
+                    slots.append(slot)
+                slot_mapping.append(slots)
+
+                if self.sliding_window is not None:
+                    sliding_window_blocks = (self.sliding_window //
+                                             self.block_size)
+                    block_table = block_table[-sliding_window_blocks:]
+                block_tables.append(block_table)
+
+        # vLLM uses cuda graph only for decoding requests.
+        # See `capture_model` API for more details.
+        batch_size = len(input_tokens)
+        # record the real batch size for cudagraph in case of padding
+        real_batch_size = batch_size
+        max_seq_len = max(context_lens)
+        use_captured_graph = (not self.model_config.enforce_eager
+                              and batch_size <= _BATCH_SIZES_TO_CAPTURE[-1]
+                              and max_seq_len <= self.max_seq_len_to_capture)
+        if use_captured_graph:
+            # Pad the input tokens, positions, and slot mapping to match the
+            # batch size of the captured graph.
+            graph_batch_size = _get_graph_batch_size(batch_size)
+            assert graph_batch_size >= batch_size
+            for _ in range(graph_batch_size - batch_size):
+                input_tokens.append([])
+                input_positions.append([])
+                slot_mapping.append([])
+                context_lens.append(0)
+                block_tables.append([])
+            batch_size = graph_batch_size
+
+        max_len = max([len(t) for t in input_tokens])
+        input_tokens = make_tensor_with_pad(input_tokens,
+                                            max_len=max_len,
+                                            pad=0,
+                                            dtype=torch.long,
+                                            device=self.device)
+        input_positions = make_tensor_with_pad(input_positions,
+                                               max_len=max_len,
+                                               pad=0,
+                                               dtype=torch.long,
+                                               device=self.device)
+        slot_mapping = make_tensor_with_pad(slot_mapping,
+                                            max_len=max_len,
+                                            pad=_PAD_SLOT_ID,
+                                            dtype=torch.long,
+                                            device=self.device)
+        context_lens = torch.tensor(context_lens,
+                                    dtype=torch.int,
+                                    device=self.device)
+
+        if use_captured_graph:
+            # When using cuda-graph all these tensors should be
+            # padded.
+            assert context_lens.shape[0] == input_tokens.shape[0]
+            assert context_lens.shape[0] == input_positions.shape[0]
+            assert context_lens.shape[0] == slot_mapping.shape[0]
+
+            # The shape of graph_block_tables is
+            # [max batch size, max context len // block size].
+            input_block_tables = self.graph_block_tables[:batch_size]
+            for i, block_table in enumerate(block_tables):
+                if block_table:
+                    input_block_tables[i, :len(block_table)] = block_table
+            block_tables = torch.tensor(input_block_tables, device=self.device)
+        else:
+            max_block_table_len = max(
+                len(block_table) for block_table in block_tables)
+            block_tables = make_tensor_with_pad(
+                block_tables,
+                max_len=max_block_table_len,
+                pad=0,
+                dtype=torch.int,
+                device=self.device,
+            )
+
+        decode_metadata = self.attn_backend.make_metadata(
+            is_prompt=False,
+            seq_lens=None,
+            seq_lens_tensor=context_lens,
+            max_query_len=None,
+            max_seq_len=None,
+            subquery_start_loc=None,
+            seq_start_loc=None,
+            context_lens_tensor=None,
+            block_tables=block_tables,
+            use_cuda_graph=use_captured_graph,
+            real_batch_size=real_batch_size,
+            seq_len=input_tokens.shape[1],
+            is_multi_query_mode=is_multi_query_mode,
+        )
+        sampling_metadata = SamplingMetadata.prepare(seq_group_metadata_list,
+                                                     None, None, self.device,
+                                                     self.pin_memory)
+        sampling_metadata.speculate_length = self.speculate_length
+        return (input_tokens, input_positions, slot_mapping, decode_metadata,
+                sampling_metadata)
+
+    def prepare_speculate_decode_input_tensors(
+        self,
+        seq_group_metadata_list: List[SequenceGroupMetadata],
+    ):
+        if self.is_driver_worker:
+            (input_tokens, input_positions, slot_mapping, decode_metadata,
+             sampling_metadata
+             ) = self._prepare_speculate_decode(seq_group_metadata_list)
+            # Broadcast the metadata.
+            metadata_dict = {
+                "input_tokens": input_tokens,
+                "input_positions": input_positions,
+                "slot_mapping": slot_mapping,
+            }
+            metadata_dict.update(decode_metadata.asdict_zerocopy())
+            broadcast_tensor_dict(metadata_dict, src=0)
+        else:
+            metadata_dict = broadcast_tensor_dict(src=0)
+            input_tokens = metadata_dict.pop("input_tokens")
+            input_positions = metadata_dict.pop("input_positions")
+            slot_mapping = metadata_dict.pop("slot_mapping")
+            decode_metadata = self.attn_backend.make_metadata(**metadata_dict)
+            sampling_metadata = SamplingMetadata(
+                seq_groups=None,
+                selected_token_indices=None,
+                categorized_sample_indices=None,
+                num_prompts=0,
+                use_speculate=True,
+                is_multi_query_mode=False,
+                speculate_length=self.speculate_length,
+            )
+        attn_metadata = AttentionMetadata(
+            num_prefills=0,
+            slot_mapping=slot_mapping,
+            num_prefill_tokens=0,
+            num_decode_tokens=input_tokens.shape[0],
+            prefill_metadata=None,
+            decode_metadata=decode_metadata,
+            kv_cache_dtype=self.kv_cache_dtype,
+        )
+        return (input_tokens, input_positions, attn_metadata,
+                sampling_metadata)
+
+    def fast_greedy_sample(self, model: torch.nn.Module,
+                           hidden_states: torch.Tensor) -> torch.Tensor:
+        # NOTE: We always use greedy sampling for the draft model during
+        # speculative decoding. In this way, we can greatly reduce the
+        # sampling overhead and avoid storing draft token's logits.
+        embedding_bias = None
+        if hasattr(model, "lm_head"):
+            lm_head_weight = model.lm_head.weight
+            embedding_bias = model.lm_head.bias
+        elif hasattr(model, "lm_head_weight"):
+            lm_head_weight = model.lm_head_weight
+        elif hasattr(model, "embed_out"):
+            lm_head_weight = model.embed_out.weight
+        elif hasattr(model, "embed_tokens"):
+            lm_head_weight = model.embed_tokens.weight
+        else:
+            raise RuntimeError("Unsupported draft model")
+        assert len(hidden_states.shape
+                   ) == 2, "hidden_states must have shape [bs*seq_len, dim]"
+        logits = torch.matmul(hidden_states, lm_head_weight.t())
+        if embedding_bias is not None:
+            logits += embedding_bias
+        logits = tensor_model_parallel_all_gather(logits)
+        logits = logits[..., :model.config.vocab_size]
+        next_tokens = torch.argmax(logits, dim=-1)
+        return next_tokens
+
+    def speculate_prefill_step(
+        self,
+        seq_group_metadata_list: List[SequenceGroupMetadata],
+        kv_caches: List[Tuple[torch.Tensor, torch.Tensor]],
+        d_kv_caches: List[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> SpeculateOutput:
+        (input_tokens, input_positions, attn_metadata, sampling_metadata,
+         lora_requests, lora_mapping, multi_modal_input
+         ) = self.prepare_input_tensors(seq_group_metadata_list)
+        attn_metadata.slot_mapping = attn_metadata.slot_mapping.view(-1)
+        input_tokens_1d = input_tokens.view(-1)
+        input_positions_1d = input_positions.view(-1)
+        # 1. Draft model prefill.
+        # The purpose of this step is to fill draft model's kv cache
+        with MarkActiveModel(ActiveModel.DRAFT):
+            hidden_states = self.draft_model(
+                input_ids=input_tokens_1d,
+                positions=input_positions_1d,
+                kv_caches=d_kv_caches,
+                attn_metadata=attn_metadata,
+            )
+        # 2. Target model prefill
+        with MarkActiveModel(ActiveModel.TARGET):
+            # Execute the model.
+            hidden_states = self.model(
+                input_ids=input_tokens_1d,
+                positions=input_positions_1d,
+                kv_caches=kv_caches,
+                attn_metadata=attn_metadata,
+            )
+            # Compute the logits.
+            logits = self.model.compute_logits(hidden_states,
+                                               sampling_metadata)
+            # Only perform sampling in the driver worker.
+            if not self.is_driver_worker:
+                return None
+            # Sample the next token.
+            output = self.model.sample(
+                logits=logits,
+                sampling_metadata=sampling_metadata,
+            )
+        speculate_outputs: SpeculateOutput = []
+        for seq_group_output in output:
+            samples = seq_group_output.samples
+            assert len(
+                samples
+            ) == 1, "Speculative decoding only allows one seq per seq group."
+            sample = samples[0]
+            seq_id = sample.parent_seq_id
+            token_id = sample.output_token
+            logprobs_dict = sample.logprobs
+            speculate_outputs.append(
+                SpeculateSequenceGroupOutput(seq_id, [token_id],
+                                             [logprobs_dict], 0,
+                                             seq_group_output.prompt_logprobs))
+        return speculate_outputs
+
+    def speculate_decode_step(
+        self,
+        seq_group_metadata_list: List[SequenceGroupMetadata],
+        target_kv_caches: List[Tuple[torch.Tensor, torch.Tensor]],
+        d_kv_caches: List[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> SpeculateOutput:
+        input_tokens, input_positions, attn_metadata, sampling_metadata = \
+            self.prepare_speculate_decode_input_tensors(seq_group_metadata_list)
+        decode_metadata = attn_metadata.decode_metadata
+        seq_lens_tensor = decode_metadata.seq_lens_tensor
+        slot_mapping = attn_metadata.slot_mapping
+        graph_batch_size = input_tokens.shape[0]
+        # 1. Run the draft model
+        for i in range(self.speculate_length):
+            with MarkActiveModel(ActiveModel.DRAFT):
+                model = self.draft_model
+                model_executable = self.draft_model
+                decode_metadata.is_multi_query_mode = False
+                decode_metadata.seq_len = 1
+                decode_metadata.seq_lens_tensor = seq_lens_tensor - self.speculate_length + i
+                if decode_metadata.use_cuda_graph:
+                    model_executable = self.d_graph_runners[graph_batch_size]
+                    # These tensors don't need to be contiguous when
+                    # using cudagraph because CUDAGraphRunner will copy
+                    # the inputs to be contiguous.
+                    input_tokens_1d = input_tokens[:, i]
+                    input_positions_1d = input_positions[:, i]
+                    attn_metadata.slot_mapping = slot_mapping[:, i]
+                else:
+                    input_tokens_1d = input_tokens[:, i].contiguous()
+                    input_positions_1d = input_positions[:, i].contiguous()
+                    attn_metadata.slot_mapping = slot_mapping[:,
+                                                              i].contiguous()
+                hidden_states = model_executable(
+                    input_ids=input_tokens_1d,
+                    positions=input_positions_1d,
+                    kv_caches=d_kv_caches,
+                    attn_metadata=attn_metadata,
+                )
+                # We always use greedy sampling to sample draft tokens.
+                next_tokens = self.fast_greedy_sample(model, hidden_states)
+                input_tokens[:, i + 1] = next_tokens
+        # 2. Run the target model
+        sampling_metadata.input_token_ids = input_tokens[:decode_metadata.
+                                                         real_batch_size]
+        sampling_metadata.is_multi_query_mode = True
+        with MarkActiveModel(ActiveModel.TARGET):
+            model = self.model
+            model_executable = self.model
+            decode_metadata.is_multi_query_mode = True
+            decode_metadata.seq_len = self.speculate_length + 1
+            input_tokens_1d = input_tokens.view(-1)
+            input_positions_1d = input_positions.view(-1)
+            attn_metadata.slot_mapping = slot_mapping.view(-1)
+            decode_metadata.seq_lens_tensor = seq_lens_tensor
+            if decode_metadata.use_cuda_graph:
+                graph_runners = self.graph_runners
+                # For speculative decoding, cudagraph is only used in the evaluation stage
+                # for target model.
+                model_executable = graph_runners[graph_batch_size]
+            # Execute the model.
+            hidden_states = model_executable(
+                input_ids=input_tokens_1d,
+                positions=input_positions_1d,
+                kv_caches=target_kv_caches,
+                attn_metadata=attn_metadata,
+            )
+            # Compute the logits.
+            logits = model.compute_logits(hidden_states, sampling_metadata)
+            # Only perform sampling in the driver worker.
+            if not self.is_driver_worker:
+                return None
+            bs, num_tokens = input_tokens.shape
+            # Convet logits from 1d to 2d, and slice it with real batch size.
+            logits = logits.view(bs, num_tokens,
+                                 -1)[:decode_metadata.real_batch_size, ...]
+            # Sample the next token.
+            output = self.model.sample(
+                logits=logits,
+                sampling_metadata=sampling_metadata,
+            )
+        speculate_outputs: SpeculateOutput = []
+        for seq_group_output in output:
+            # 1. Handling the case when multiple tokens can be generated.
+            # Here we drop the last sampled token when all draft tokens were accepted.
+            # When all draft tokens were accepted, the last 2 generated tokens (the last
+            # accepted draft token plus the token sampled from its logits) will miss
+            # their kv caches in the draft model and requires multi-query attention.
+            # Mixing single query and multi-query attention is currently not supported.
+            seq_id = seq_group_output.parent_seq_id
+            num_accepted = seq_group_output.num_accepted_tokens
+            max_num_generated_tokens = min(num_accepted + 1,
+                                           sampling_metadata.speculate_length)
+            output_tokens = seq_group_output.output_tokens[:
+                                                           max_num_generated_tokens]
+            output_token_logprobs = seq_group_output.logprobs_list[:
+                                                                   max_num_generated_tokens]
+            speculate_outputs.append(
+                SpeculateSequenceGroupOutput(seq_id,
+                                             output_tokens,
+                                             output_token_logprobs,
+                                             num_accepted,
+                                             prompt_logprobs=None))
+        return speculate_outputs
+
+    @torch.inference_mode()
+    def speculate_execute_model(
+        self,
+        seq_group_metadata_list: List[SequenceGroupMetadata],
+        is_prompt: bool,
+        kv_caches: List[Tuple[torch.Tensor, torch.Tensor]],
+        d_kv_caches: List[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> SpeculateOutput:
+        if is_prompt:
+            return self.speculate_prefill_step(seq_group_metadata_list,
+                                               kv_caches, d_kv_caches)
+        return self.speculate_decode_step(seq_group_metadata_list, kv_caches,
+                                          d_kv_caches)
+
+    def __del__(self) -> None:
+        # Delete the CUDA graphs before deleting the pynccl communicator.
+        # NOTE(woosuk): This is necessary because otherwise deadlocks can
+        # happen.
+        # FIXME(woosuk): This is a bit hacky. Find a more robust solution.
+        # TODO(youkaichao): when we get enough user feedback that pynccl is
+        # more stable than cupy, we can remove this, e.g. in v0.4.1.
+        self.graph_runners.clear()
+        if self.use_speculate:
+            self.d_graph_runners.clear()
+        self.pynccl_backend = None
 
     @property
     def vocab_size(self) -> int:

@@ -106,6 +106,7 @@ class ModelConfig:
         disable_sliding_window: bool = False,
         skip_tokenizer_init: bool = False,
         served_model_name: Optional[Union[str, List[str]]] = None,
+        is_draft_model: Optional[bool] = False,
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
@@ -133,6 +134,8 @@ class ModelConfig:
         self.max_logprobs = max_logprobs
         self.disable_sliding_window = disable_sliding_window
         self.skip_tokenizer_init = skip_tokenizer_init
+        # Flag to mark if the model is used as draft model for speculative decoding
+        self.is_draft_model = is_draft_model
 
         self.hf_config = get_config(self.model, trust_remote_code, revision,
                                     code_revision, rope_scaling, rope_theta)
@@ -230,7 +233,8 @@ class ModelConfig:
         parallel_config: "ParallelConfig",
     ) -> None:
         total_num_attention_heads = self.hf_text_config.num_attention_heads
-        tensor_parallel_size = parallel_config.tensor_parallel_size
+        tensor_parallel_size = parallel_config.draft_model_tp_size if self.is_draft_model \
+                               else parallel_config.tensor_parallel_size
         if total_num_attention_heads % tensor_parallel_size != 0:
             raise ValueError(
                 f"Total number of attention heads ({total_num_attention_heads})"
@@ -331,8 +335,9 @@ class ModelConfig:
         # the tensor parallel size. We will replicate the KV heads in the
         # case where the number of KV heads is smaller than the tensor
         # parallel size so each GPU has at least one KV head.
-        return max(1,
-                   total_num_kv_heads // parallel_config.tensor_parallel_size)
+        tensor_parallel_size = parallel_config.draft_model_tp_size if self.is_draft_model \
+                               else parallel_config.tensor_parallel_size
+        return max(1, total_num_kv_heads // tensor_parallel_size)
 
     def get_num_attention_heads(self,
                                 parallel_config: "ParallelConfig") -> int:
@@ -584,6 +589,7 @@ class ParallelConfig:
         ray_workers_use_nsight: bool = False,
         placement_group: Optional["PlacementGroup"] = None,
         distributed_executor_backend: Optional[str] = None,
+        draft_model_tp_size: Optional[int] = 1,
     ) -> None:
         self.pipeline_parallel_size = pipeline_parallel_size
         self.tensor_parallel_size = tensor_parallel_size
@@ -593,6 +599,10 @@ class ParallelConfig:
         self.tokenizer_pool_config = tokenizer_pool_config
         self.ray_workers_use_nsight = ray_workers_use_nsight
         self.placement_group = placement_group
+        self.draft_model_tp_size = draft_model_tp_size
+        assert draft_model_tp_size in (
+            1, tensor_parallel_size
+        ), "Draft model tp size must be 1 or the same as target model"
 
         self.world_size = pipeline_parallel_size * self.tensor_parallel_size
         if worker_use_ray:
@@ -898,6 +908,7 @@ class SpeculativeConfig:
                 max_seq_len_to_capture=target_model_config.
                 max_seq_len_to_capture,
                 max_logprobs=target_model_config.max_logprobs,
+                is_draft_model=True,
             )
 
             draft_model_config.max_model_len = (

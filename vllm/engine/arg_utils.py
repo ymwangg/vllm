@@ -93,6 +93,7 @@ class EngineArgs:
     guided_decoding_backend: str = 'outlines'
     # Speculative decoding configuration.
     speculative_model: Optional[str] = None
+    draft_model_tp_size: Optional[int] = 1
     num_speculative_tokens: Optional[int] = None
     speculative_max_model_len: Optional[int] = None
     speculative_disable_by_batch_size: Optional[int] = None
@@ -529,6 +530,14 @@ class EngineArgs:
             help=
             'The name of the draft model to be used in speculative decoding.')
         parser.add_argument(
+            '--draft-model-tp-size',
+            type=int,
+            default=EngineArgs.draft_model_tp_size,
+            help=
+            'The tensor parallel size of the draft model to be used in speculative decoding.'
+        )
+
+        parser.add_argument(
             '--num-speculative-tokens',
             type=int,
             default=EngineArgs.num_speculative_tokens,
@@ -669,7 +678,8 @@ class EngineArgs:
                 self.tokenizer_pool_extra_config,
             ),
             ray_workers_use_nsight=self.ray_workers_use_nsight,
-            distributed_executor_backend=self.distributed_executor_backend)
+            distributed_executor_backend=self.distributed_executor_backend,
+            draft_model_tp_size=self.draft_model_tp_size)
 
         speculative_config = SpeculativeConfig.maybe_create_spec_config(
             target_model_config=model_config,

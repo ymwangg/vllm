@@ -83,12 +83,18 @@ class Worker(WorkerBase):
             kv_cache_dtype=self.cache_config.cache_dtype,
             is_driver_worker=is_driver_worker,
             vision_language_config=vision_language_config,
+            rank=self.rank,
+            speculative_config=speculative_config,
         )
         # Uninitialized cache engine. Will be initialized by
         # initialize_cache.
         self.cache_engine: CacheEngine
         # Initialize gpu_cache as embedding models don't initialize kv_caches
         self.gpu_cache: Optional[List[torch.tensor]] = None
+
+        # Cache engine of draft model for speculative decoding.
+        self.d_cache_engine = None
+        self.d_gpu_cache = None
 
     def init_device(self) -> None:
         if self.device_config.device.type == "cuda":
@@ -207,10 +213,23 @@ class Worker(WorkerBase):
         self.cache_engine = CacheEngine(self.cache_config, self.model_config,
                                         self.parallel_config)
         self.gpu_cache = self.cache_engine.gpu_cache
+        self.model_runner.set_block_size(self.cache_engine.block_size)
+        # Init cache engine for draft model when using speculative decoding.
+        if self.use_speculate:
+            self.d_cache_engine = CacheEngine(
+                self.cache_config,
+                self.draft_model_config,
+                self.parallel_config,
+            )
+            self.d_gpu_cache = self.d_cache_engine.gpu_cache
 
     def _warm_up_model(self) -> None:
         if not self.model_config.enforce_eager:
-            self.model_runner.capture_model(self.gpu_cache)
+            if self.use_speculate:
+                self.model_runner.speculate_capture_model(
+                    self.gpu_cache, self.d_gpu_cache)
+            else:
+                self.model_runner.capture_model(self.gpu_cache)
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
@@ -222,12 +241,20 @@ class Worker(WorkerBase):
         blocks_to_copy: torch.Tensor,
     ) -> None:
         # Issue cache operations.
-        if blocks_to_swap_in.numel() > 0:
-            self.cache_engine.swap_in(blocks_to_swap_in)
-        if blocks_to_swap_out.numel() > 0:
-            self.cache_engine.swap_out(blocks_to_swap_out)
-        if blocks_to_copy.numel() > 0:
-            self.cache_engine.copy(blocks_to_copy)
+        # TODO(woosuk): Profile swapping overhead and optimize if needed.
+        def execute_cache_swap(cache_engine):
+            if blocks_to_swap_in.numel() > 0:
+                cache_engine.swap_in(blocks_to_swap_in)
+            if blocks_to_swap_out.numel() > 0:
+                cache_engine.swap_out(blocks_to_swap_out)
+            if blocks_to_copy.numel() > 0:
+                cache_engine.copy(blocks_to_copy)
+
+        cache_engines = [self.cache_engine]
+        if self.use_speculate:
+            cache_engines.append(self.d_cache_engine)
+        for cache_engine in cache_engines:
+            execute_cache_swap(cache_engine)
 
     @torch.inference_mode()
     def execute_model(
@@ -277,8 +304,13 @@ class Worker(WorkerBase):
         if num_seq_groups == 0:
             return []
 
-        output = self.model_runner.execute_model(seq_group_metadata_list,
-                                                 self.gpu_cache)
+        if use_speculate:
+            output = self.model_runner.speculate_execute_model(
+                seq_group_metadata_list, is_prompt, self.gpu_cache,
+                self.d_gpu_cache)
+        else:
+            output = self.model_runner.execute_model(seq_group_metadata_list,
+                                                     self.gpu_cache)
 
         # Worker only supports single-step execution. Wrap the output in a list
         # to conform to interface.
@@ -337,9 +369,13 @@ class Worker(WorkerBase):
     def get_cache_block_size_bytes(self) -> int:
         """Get the size of the KV cache block size in bytes.
         """
-        return CacheEngine.get_cache_block_size(self.cache_config,
-                                                self.model_config,
-                                                self.parallel_config)
+        cache_block_size = CacheEngine.get_cache_block_size(
+            self.cache_config, self.model_config, self.parallel_config)
+        if self.use_speculate:
+            cache_block_size += CacheEngine.get_cache_block_size(
+                self.cache_config, self.draft_model_config,
+                self.parallel_config)
+        return cache_block_size
 
 
 def init_worker_distributed_environment(
@@ -354,8 +390,11 @@ def init_worker_distributed_environment(
     init_distributed_environment(parallel_config.world_size, rank,
                                  distributed_init_method, local_rank)
 
-    ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
-                                      parallel_config.pipeline_parallel_size)
+    ensure_model_parallel_initialized(
+        parallel_config.tensor_parallel_size,
+        parallel_config.pipeline_parallel_size,
+        draft_model_tp_size=parallel_config.draft_model_tp_size,
+    )
 
 
 def _check_if_gpu_supports_dtype(torch_dtype: torch.dtype):

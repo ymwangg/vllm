@@ -235,6 +235,7 @@ class Sequence:
         self.data = SequenceData(self.prompt_token_ids)
         self.output_logprobs: SampleLogprobs = []
         self.output_text = ""
+        self.new_output_text = ""
 
         self.logical_token_blocks: List[LogicalTokenBlock] = []
         # Initialize the logical token blocks with the prompt token ids.
@@ -245,8 +246,13 @@ class Sequence:
         # Used for incremental detokenization
         self.prefix_offset = 0
         self.read_offset = 0
+        self.new_token_start_loc = 0
+
         # Input + output tokens
         self.tokens: Optional[List[str]] = None
+
+        # Used for speculative decoding
+        self.acceptance_history: List[int] = []
 
     @property
     def prompt(self) -> Optional[str]:
@@ -384,6 +390,13 @@ class Sequence:
 
     def is_prefill(self) -> bool:
         return self.data.stage == SequenceStage.PREFILL
+
+    def mark_decode_step(self) -> None:
+        self.new_token_start_loc = self.data.get_len()
+
+    def update_acceptance_history(self, num_accepted_tokens: int) -> None:
+        if num_accepted_tokens is not None:
+            self.acceptance_history.append(num_accepted_tokens)
 
     def __repr__(self) -> str:
         return (f"Sequence(seq_id={self.seq_id}, "
@@ -733,10 +746,12 @@ class CompletionSequenceGroupOutput(SequenceGroupOutput):
         self,
         samples: List[SequenceOutput],
         prompt_logprobs: Optional[PromptLogprobs],
+        num_accepted_tokens: Optional[int] = None,
     ) -> None:
         self.samples = samples
         # Prompt logprob for each prompt query token.
         self.prompt_logprobs = prompt_logprobs
+        self.num_accepted_tokens = num_accepted_tokens
 
     def __repr__(self) -> str:
         return (f"CompletionSequenceGroupOutput(samples={self.samples}, "
@@ -854,6 +869,8 @@ class ExecuteModelRequest:
     num_lookahead_slots: int = 0
     # The number of requests in the running queue.
     running_queue_size: int = 0
+    # Whether using speculative decoding
+    use_speculate: bool = False
 
     def clone(
         self, seq_group_metadata_list: List[SequenceGroupMetadata]
@@ -867,3 +884,75 @@ class ExecuteModelRequest:
             num_lookahead_slots=self.num_lookahead_slots,
             running_queue_size=self.running_queue_size,
         )
+
+
+class SpeculateSequenceGroupOutput:
+    """The model output associated with a sequence.
+
+    Args:
+        parent_seq_id: The ID of the parent sequence (for forking in beam
+            search).
+        output_token: The output token ID.
+        logprobs: The logprobs of the output token.
+            (Token id -> logP(x_i+1 | x_0, ..., x_i))
+        num_accepted_tokens: The number of draft tokens accepted.
+    """
+
+    def __init__(
+        self,
+        parent_seq_id: int,
+        output_tokens: List[int],
+        logprobs: List[Dict[int, float]],
+        num_accepted_tokens: int,
+        prompt_logprobs: Optional[PromptLogprobs] = None,
+    ) -> None:
+        self.parent_seq_id = parent_seq_id
+        self.output_tokens = output_tokens
+        self.logprobs = logprobs
+        self.num_accepted_tokens = num_accepted_tokens
+        self.prompt_logprobs = prompt_logprobs
+
+    def __repr__(self) -> str:
+        return (
+            f"SpeculateSequenceGroupOutput(parent_seq_id={self.parent_seq_id}, "
+            f"output_tokens={self.output_tokens}, "
+            f"logprobs={self.logprobs}), num_accepted_tokens={self.num_accepted_tokens}"
+        )
+
+
+class SpeculateSequenceOutput:
+    """The model output associated with a sequence with multiple generated
+       tokens.
+
+    Args:
+        parent_seq_id: The ID of the parent sequence (for forking in beam
+            search).
+        output_tokens: The output tokens ID.
+        logprobs_list: The list of logprobs of each output token
+            List[(Token id -> logP(x_i+1 | x_0, ..., x_i))].
+        num_accepted_tokens: The number of accepted tokens.
+        parent_probs: The logprobs of parent token. This is useful for
+            speculative decoding.
+    """
+
+    def __init__(
+        self,
+        parent_seq_id: int,
+        output_tokens: List[int],
+        logprobs_list: List[Dict[int, float]],
+        num_accepted_tokens: int,
+    ) -> None:
+        self.parent_seq_id = parent_seq_id
+        self.output_tokens = output_tokens
+        self.logprobs_list = logprobs_list
+        self.num_accepted_tokens = num_accepted_tokens
+
+    def __repr__(self) -> str:
+        return (f"SequenceOutput(parent_seq_id={self.parent_seq_id}, "
+                f"output_tokens={self.output_tokens}, "
+                f"logprobs_list={self.logprobs_list})")
+
+# For each sequence group, we generate a list of SequenceOutput object,
+# each of which contains one possible candidate for the next token.
+SpeculateOutput = List[SpeculateSequenceGroupOutput]
+SpeculateSamplerOutput = List[SpeculateSequenceOutput]
