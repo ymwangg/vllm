@@ -76,7 +76,6 @@ class ModelConfig:
             names provided, the first name will be used. If not specified, 
             the model name will be the same as `model`.
     """
-
     def __init__(
         self,
         model: str,
@@ -97,6 +96,7 @@ class ModelConfig:
         max_logprobs: int = 5,
         skip_tokenizer_init: bool = False,
         served_model_name: Optional[Union[str, List[str]]] = None,
+        is_draft_model: Optional[bool] = False,
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
@@ -117,6 +117,8 @@ class ModelConfig:
                                        or max_context_len_to_capture)
         self.max_logprobs = max_logprobs
         self.skip_tokenizer_init = skip_tokenizer_init
+        # Flag to mark if the model is used as draft model for speculative decoding
+        self.is_draft_model = is_draft_model
 
         self.hf_config = get_config(self.model, trust_remote_code, revision,
                                     code_revision)
@@ -218,7 +220,8 @@ class ModelConfig:
         parallel_config: "ParallelConfig",
     ) -> None:
         total_num_attention_heads = self.hf_text_config.num_attention_heads
-        tensor_parallel_size = parallel_config.tensor_parallel_size
+        tensor_parallel_size = parallel_config.draft_model_tp_size if self.is_draft_model \
+                               else parallel_config.tensor_parallel_size
         if total_num_attention_heads % tensor_parallel_size != 0:
             raise ValueError(
                 f"Total number of attention heads ({total_num_attention_heads})"
@@ -304,8 +307,9 @@ class ModelConfig:
         # the tensor parallel size. We will replicate the KV heads in the
         # case where the number of KV heads is smaller than the tensor
         # parallel size so each GPU has at least one KV head.
-        return max(1,
-                   total_num_kv_heads // parallel_config.tensor_parallel_size)
+        tensor_parallel_size = parallel_config.draft_model_tp_size if self.is_draft_model \
+                               else parallel_config.tensor_parallel_size
+        return max(1, total_num_kv_heads // tensor_parallel_size)
 
     def get_num_attention_heads(self,
                                 parallel_config: "ParallelConfig") -> int:
@@ -329,7 +333,6 @@ class CacheConfig:
         num_gpu_blocks_override: Number of GPU blocks to use. This overrides the
             profiled num_gpu_blocks if specified. Does nothing if None.
     """
-
     def __init__(
         self,
         block_size: int,
@@ -535,7 +538,6 @@ class ParallelConfig:
         ray_workers_use_nsight: Whether to profile Ray workers with nsight, see
             https://docs.ray.io/en/latest/ray-observability/user-guides/profiling.html#profiling-nsight-profiler.
     """
-
     def __init__(
         self,
         pipeline_parallel_size: int,
@@ -546,6 +548,7 @@ class ParallelConfig:
         tokenizer_pool_config: Optional[TokenizerPoolConfig] = None,
         ray_workers_use_nsight: bool = False,
         placement_group: Optional["PlacementGroup"] = None,
+        draft_model_tp_size: Optional[int] = 1,
     ) -> None:
         self.pipeline_parallel_size = pipeline_parallel_size
         self.tensor_parallel_size = tensor_parallel_size
@@ -555,6 +558,7 @@ class ParallelConfig:
         self.tokenizer_pool_config = tokenizer_pool_config
         self.ray_workers_use_nsight = ray_workers_use_nsight
         self.placement_group = placement_group
+        self.draft_model_tp_size = draft_model_tp_size
 
         self.world_size = pipeline_parallel_size * self.tensor_parallel_size
         if self.world_size > 1:
@@ -601,7 +605,6 @@ class SchedulerConfig:
         enable_chunked_prefill: If True, prefill requests can be chunked based
             on the remaining max_num_batched_tokens.
     """
-
     def __init__(
         self,
         max_num_batched_tokens: Optional[int],
@@ -660,7 +663,6 @@ class SchedulerConfig:
 
 
 class DeviceConfig:
-
     def __init__(self, device: str = "auto") -> None:
         if device == "auto":
             # Automated device type detection
@@ -690,7 +692,6 @@ class SpeculativeConfig:
     The configuration is currently specialized to draft-model speculative
     decoding with top-1 proposals.
     """
-
     @staticmethod
     def maybe_create_spec_config(
         target_model_config: ModelConfig,
@@ -988,7 +989,6 @@ class LoRAConfig:
 class VisionLanguageConfig:
     """Configs the input data format and how models should run for
     vision language models."""
-
     class ImageInputType(enum.Enum):
         """Image input type into the vision language model.
 
@@ -1223,3 +1223,9 @@ class EngineConfig:
         """
         return dict(
             (field.name, getattr(self, field.name)) for field in fields(self))
+
+
+@dataclass
+class SpeculateConfig:
+    draft_model_config: ModelConfig
+    speculate_length: int

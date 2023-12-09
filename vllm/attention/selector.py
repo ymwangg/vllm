@@ -22,6 +22,9 @@ class _Backend(enum.Enum):
 
 @lru_cache(maxsize=None)
 def get_attn_backend(dtype: torch.dtype) -> Type[AttentionBackend]:
+    logger.info("Using SpeculateAttn backend.")
+    from vllm.attention.backends.speculate_attn import SpeculateAttnBackend
+    return SpeculateAttnBackend
     backend = _which_attn_to_use(dtype)
     if backend == _Backend.FLASH_ATTN:
         logger.info("Using FlashAttention-2 backend.")
@@ -49,7 +52,6 @@ def get_attn_backend(dtype: torch.dtype) -> Type[AttentionBackend]:
         return FlashInferBackend
     else:
         raise ValueError("Invalid attention backend.")
-
 
 def _which_attn_to_use(dtype: torch.dtype) -> _Backend:
     """Returns which flash attention backend to use."""

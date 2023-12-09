@@ -34,6 +34,7 @@ class CompletionOutput:
         finish_reason: Optional[str] = None,
         stop_reason: Union[int, str, None] = None,
         lora_request: Optional[LoRARequest] = None,
+        acceptance_history: Optional[List[int]] = None,
     ) -> None:
         self.index = index
         self.text = text
@@ -43,6 +44,7 @@ class CompletionOutput:
         self.finish_reason = finish_reason
         self.stop_reason = stop_reason
         self.lora_request = lora_request
+        self.acceptance_history = acceptance_history
 
     def finished(self) -> bool:
         return self.finish_reason is not None
@@ -120,7 +122,7 @@ class RequestOutput:
                              seq.get_cumulative_logprob(),
                              seq.output_logprobs if include_logprobs else None,
                              SequenceStatus.get_finished_reason(seq.status),
-                             seq.stop_reason) for seq in top_n_seqs
+                             seq.stop_reason, acceptance_history=seq.acceptance_history) for seq in top_n_seqs
         ]
 
         # Every sequence in the sequence group should have the same prompt.

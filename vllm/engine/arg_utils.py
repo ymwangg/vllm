@@ -9,6 +9,9 @@ from vllm.config import (CacheConfig, DecodingConfig, DeviceConfig,
                          TokenizerPoolConfig, VisionLanguageConfig)
 from vllm.model_executor.layers.quantization import QUANTIZATION_METHODS
 from vllm.utils import str_to_int_tuple
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 def nullable_str(val: str):
@@ -532,8 +535,10 @@ class EngineArgs:
                                    model_config.get_sliding_window(),
                                    self.enable_prefix_caching)
         parallel_config = ParallelConfig(
-            self.pipeline_parallel_size, self.tensor_parallel_size,
-            self.worker_use_ray, self.max_parallel_loading_workers,
+            self.pipeline_parallel_size,
+            self.tensor_parallel_size,
+            self.worker_use_ray,
+            self.max_parallel_loading_workers,
             self.disable_custom_all_reduce,
             TokenizerPoolConfig.create_config(
                 self.tokenizer_pool_size,
@@ -557,7 +562,7 @@ class EngineArgs:
         scheduler_config = SchedulerConfig(
             self.max_num_batched_tokens,
             self.max_num_seqs,
-            model_config.max_model_len,
+            max_model_len,
             self.use_v2_block_manager,
             num_lookahead_slots=(self.num_lookahead_slots
                                  if speculative_config is None else

@@ -44,8 +44,12 @@ class LogitsProcessor(nn.Module):
         if self.logits_as_input:
             logits = hidden_states
         else:
-            hidden_states = _prune_hidden_states(hidden_states,
-                                                 sampling_metadata)
+            # NOTE: For the multi-query mode in speculative decoding, we need
+            # to keep logits for all tokens.
+            # hidden_states is of shape [bsz * num_query_tokens, vocab_size]
+            if not sampling_metadata.is_multi_query_mode:
+                hidden_states = _prune_hidden_states(hidden_states,
+                                                    sampling_metadata)
 
             # Get the logits for the next tokens.
             logits = self._get_logits(hidden_states, embedding, embedding_bias)
@@ -67,7 +71,9 @@ class LogitsProcessor(nn.Module):
         logits = tensor_model_parallel_gather(logits)
         # Remove paddings in vocab (if any).
         if logits is not None:
-            logits = logits[:, :self.org_vocab_size]
+            # We use ... here because logits may be of shape [bs, seq_len, vocab_size]
+            # in speculative decoding.
+            logits = logits[..., :self.org_vocab_size]
         return logits
 
     def extra_repr(self) -> str:

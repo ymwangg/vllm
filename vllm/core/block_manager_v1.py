@@ -12,7 +12,7 @@ from vllm.core.evictor_v1 import EvictionPolicy, Evictor, make_evictor
 from vllm.core.interfaces import AllocStatus, BlockSpaceManager
 from vllm.logger import init_logger
 from vllm.sequence import Sequence, SequenceGroup, SequenceStatus
-from vllm.utils import Device
+from vllm.utils import Device, cdiv
 
 logger = init_logger(__name__)
 
@@ -256,11 +256,14 @@ class BlockSpaceManagerV1(BlockSpaceManager):
         # Mapping: seq_id -> BlockTable.
         self.block_tables: Dict[int, BlockTable] = {}
 
-    def can_allocate(self, seq_group: SequenceGroup) -> AllocStatus:
+    def can_allocate(self,
+                     seq_group: SequenceGroup,
+                     num_padding_tokens: int = 0) -> AllocStatus:
         # FIXME(woosuk): Here we assume that all sequences in the group share
         # the same prompt. This may not be true for preempted sequences.
         seq = seq_group.get_seqs(status=SequenceStatus.WAITING)[0]
-        num_required_blocks = len(seq.logical_token_blocks)
+        num_required_blocks = cdiv(seq.get_len() + num_padding_tokens,
+                                   self.block_size)
 
         if self.block_sliding_window is not None:
             num_required_blocks = min(num_required_blocks,
@@ -276,13 +279,16 @@ class BlockSpaceManagerV1(BlockSpaceManager):
         else:
             return AllocStatus.LATER
 
-    def allocate(self, seq_group: SequenceGroup) -> None:
+    def allocate(self,
+                 seq_group: SequenceGroup,
+                 num_padding_tokens: int = 0) -> None:
         # NOTE: Here we assume that all sequences in the group have the same
         # prompt.
         seq = seq_group.get_seqs(status=SequenceStatus.WAITING)[0]
 
         # Allocate new physical token blocks that will store the prompt tokens.
-        num_prompt_blocks = len(seq.logical_token_blocks)
+        num_prompt_blocks = cdiv(seq.data.get_len() + num_padding_tokens,
+                                 self.block_size)
 
         block_table: BlockTable = []
         for logical_idx in range(num_prompt_blocks):
@@ -316,6 +322,16 @@ class BlockSpaceManagerV1(BlockSpaceManager):
         num_free_gpu_blocks = self.gpu_allocator.get_num_free_blocks()
         num_seqs = seq_group.num_seqs(status=SequenceStatus.RUNNING)
         return num_seqs <= num_free_gpu_blocks
+
+    def can_append_multiple_slots(self,
+                                  seq_group: SequenceGroup,
+                                  num_new_tokens: int = 1) -> bool:
+        # Simple heuristic: If there is at least one free block
+        # for each sequence, we can append.
+        num_free_gpu_blocks = self.gpu_allocator.get_num_free_blocks()
+        num_seqs = seq_group.num_seqs(status=SequenceStatus.RUNNING)
+        return num_seqs * cdiv(num_new_tokens,
+                               self.block_size) <= num_free_gpu_blocks
 
     def _promote_last_block(
         self,
@@ -427,6 +443,32 @@ class BlockSpaceManagerV1(BlockSpaceManager):
             block_table[-1] = new_block
             self.gpu_allocator.free(last_block)
             return {last_block.block_number: [new_block.block_number]}
+
+    def append_multiple_slots(
+            self,
+            seq: Sequence,
+            num_new_tokens: int = 1) -> Optional[Tuple[int, int]]:
+        """Allocate multiple physical slots for new tokens. This function is used in
+           speculative decoding.
+        """
+        block_table = self.block_tables[seq.seq_id]
+        seq_len = seq.data.get_len()
+        num_required_blocks = cdiv(seq_len + num_new_tokens, self.block_size)
+        while len(block_table) < num_required_blocks:
+            if (self.block_sliding_window
+                    and len(block_table) >= self.block_sliding_window):
+                # reuse a block
+                block_table.append(block_table[len(block_table) %
+                                               self.block_sliding_window])
+            else:
+                # The sequence has a new logical block.
+                # Allocate a new physical block.
+                new_block = self._allocate_last_physical_block(seq)
+                block_table.append(new_block)
+        last_block = block_table[-1]
+        assert last_block.ref_count == 1, "Block sharing is not supported yet."
+        assert not self.enable_caching, "Prefix caching is not supported yet."
+        return None
 
     def fork(self, parent_seq: Sequence, child_seq: Sequence) -> None:
         # NOTE: fork does not allocate a new physical block.

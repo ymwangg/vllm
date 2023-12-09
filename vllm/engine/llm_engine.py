@@ -24,8 +24,10 @@ from vllm.outputs import RequestOutput
 from vllm.sampling_params import SamplingParams
 from vllm.sequence import (ExecuteModelRequest, MultiModalData, SamplerOutput,
                            Sequence, SequenceGroup, SequenceGroupMetadata,
-                           SequenceStatus)
+                           SequenceStatus, SpeculateOutput,
+                           SpeculateSequenceGroupOutput)
 from vllm.transformers_utils.detokenizer import Detokenizer
+from vllm.transformers_utils.tokenizer import speculate_detokenize_incrementally
 from vllm.transformers_utils.tokenizer_group import (BaseTokenizerGroup,
                                                      get_tokenizer_group)
 from vllm.usage.usage_lib import (UsageContext, is_usage_stats_enabled,
@@ -80,7 +82,6 @@ class LLMEngine:
         log_stats: Whether to log statistics.
         usage_context: Specified entry point, used for usage info collection
     """
-
     def __init__(
         self,
         model_config: ModelConfig,
@@ -96,6 +97,7 @@ class LLMEngine:
         executor_class: Type[ExecutorBase],
         log_stats: bool,
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
+        speculate_config: Optional[SpeculateConfig] = None,
     ) -> None:
         logger.info(
             "Initializing an LLM engine (v%s) with config: "
@@ -134,6 +136,11 @@ class LLMEngine:
         # TODO(woosuk): Print more configs in debug mode.
 
         self.model_config = model_config
+
+        # speculative decoding related params
+        self.speculate_config = speculate_config
+        self.use_speculate = speculate_config is not None
+
         self.cache_config = cache_config
         self.lora_config = lora_config
         self.vision_language_config = vision_language_config
@@ -214,7 +221,10 @@ class LLMEngine:
         # Create the scheduler.
         # NOTE: the cache_config here have been updated with the numbers of
         # GPU and CPU blocks, which are profiled in the distributed executor.
-        self.scheduler = Scheduler(scheduler_config, cache_config, lora_config)
+        self.scheduler = Scheduler(scheduler_config,
+                                   cache_config,
+                                   lora_config,
+                                   speculate_config=speculate_config)
 
         # Metric Logging.
         if self.log_stats:
@@ -294,6 +304,7 @@ class LLMEngine:
             executor_class=executor_class,
             log_stats=not engine_args.disable_log_stats,
             usage_context=usage_context,
+            speculate_config=engine_config.speculate_config,
         )
         return engine
 

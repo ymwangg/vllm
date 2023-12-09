@@ -11,7 +11,7 @@ from vllm.model_executor.sampling_metadata import (SamplingMetadata,
                                                    SequenceGroupToSample)
 from vllm.sampling_params import SamplingType
 from vllm.sequence import (Logprob, PromptLogprobs, SampleLogprobs,
-                           SamplerOutput, SequenceGroupOutput, SequenceOutput)
+                           SamplerOutput, SequenceGroupOutput, SequenceOutput, SpeculateSequenceOutput, SpeculateSamplerOutput)
 
 # (num_token_ids, num_parent_ids) per sequence group.
 SampleResultType = List[Tuple[List[int], List[int]]]
@@ -57,18 +57,19 @@ class Sampler(nn.Module):
             sampling_metadata: Metadata for sampling.
         """
         assert logits is not None
-        _, vocab_size = logits.shape
+        vocab_size = logits.shape[-1]
 
         logits = _apply_min_tokens_penalty(logits, sampling_metadata)
 
         # Prepare sampling tensors with pinned memory to avoid blocking.
-        (sampling_tensors, do_penalties, do_top_p_top_k,
-         do_min_p) = SamplingTensors.from_sampling_metadata(
+        (sampling_tensors, do_penalties, do_top_p_top_k, do_min_p,
+         do_greedy) = SamplingTensors.from_sampling_metadata(
              sampling_metadata, vocab_size, logits.device, logits.dtype)
 
         # Apply presence and frequency penalties.
         if do_penalties:
-            logits = _apply_penalties(logits, sampling_tensors.prompt_tokens,
+            logits = _apply_penalties(logits, sampling_metadata,
+                                      sampling_tensors.prompt_tokens,
                                       sampling_tensors.output_tokens,
                                       sampling_tensors.presence_penalties,
                                       sampling_tensors.frequency_penalties,
@@ -76,7 +77,10 @@ class Sampler(nn.Module):
 
         # Apply temperature scaling.
         # Use in-place division to avoid creating a new tensor.
-        logits.div_(sampling_tensors.temperatures.unsqueeze_(dim=1))
+        if sampling_metadata.is_multi_query_mode:
+            logits.div_(sampling_tensors.temperatures.view(-1, 1, 1))
+        else:
+            logits.div_(sampling_tensors.temperatures.unsqueeze_(dim=1))
 
         if do_top_p_top_k:
             logits = _apply_top_k_top_p(logits, sampling_tensors.top_ps,
@@ -149,6 +153,66 @@ def _get_bin_counts_and_mask(
     return bin_counts, mask
 
 
+def _get_multi_query_bin_counts_and_mask(
+    tokens: torch.Tensor,
+    input_token_ids: torch.Tensor,
+    vocab_size: int,
+    num_seqs: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Similar to _get_bin_counts_and_mask, this function
+    supports multiple tokens per request.
+    Args:
+        tokens (torch.Tensor): tensor of all generated token ids, padded to
+            the longest sequence.
+        input_token_ids (torch.Tensor): tensor of all input token ids.
+        vocab_size (int): vocabulary size, vocab_size + 1 is used for padding.
+        num_seqs (int): batch size.
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: (bin_counts, mask)
+    """
+    assert len(tokens.shape) == len(input_token_ids.shape) == 2
+    assert input_token_ids.shape[0] == num_seqs
+    num_tokens = input_token_ids.shape[1]
+
+    # For the case of multiple input tokens per request, each token will have
+    # one bin counter. We also need to consider the causal relationship among
+    # tokens of the same request. We first construct bins without counting
+    # new tokens, and then add them back.
+    bin_counts = torch.zeros((num_seqs, vocab_size + 1),
+                             dtype=torch.long,
+                             device=tokens.device)
+    bin_counts.scatter_add_(1, tokens, torch.ones_like(tokens))
+
+    # reshape bin_counts to [num_seqs, num_tokens, vocab_size + 1]
+    bin_counts = bin_counts[:, None, :].repeat([1, num_tokens, 1])
+
+    # construct tokens_to_add with shape [num_seqs, num_tokens, num_tokens]
+    tokens_to_add = input_token_ids[:, None, :].repeat(1, num_tokens, 1)
+
+    # select draft tokens to add using causal mask
+    # for example, the causal mask for input with 4 draft tokens has the
+    # following structure
+    # [
+    #     [1, 1, 1, 1, 1],
+    #     [1, 0, 1, 1, 1],
+    #     [1, 0, 0, 1, 1],
+    #     [1, 0, 0, 9, 1],
+    #     [1, 0, 0, 0, 0],
+    # ]
+    causal_mask = torch.triu(torch.ones(num_tokens, num_tokens),
+                             diagonal=1).to(torch.bool)
+    # the first token was generated from previous step and has been counted before, so we
+    # remove them here.
+    causal_mask[:, 0] = True
+    tokens_to_add[causal_mask[None, :, :].expand(num_seqs, num_tokens,
+                                                 num_tokens)] = vocab_size
+    bin_counts = bin_counts.scatter_add_(2, tokens_to_add,
+                                         torch.ones_like(tokens_to_add))
+    bin_counts = bin_counts[:, :, :vocab_size]
+    mask = bin_counts > 0
+    return (bin_counts, mask)
+
+
 def _apply_min_tokens_penalty(
     logits: torch.Tensor,
     sampling_metadata: SamplingMetadata,
@@ -196,26 +260,50 @@ def _apply_min_tokens_penalty(
     return logits
 
 
-def _apply_penalties(logits: torch.Tensor, prompt_tokens_tensor: torch.Tensor,
+def _apply_penalties(logits: torch.Tensor, sampling_metadata: SamplingMetadata,
+                     prompt_tokens_tensor: torch.Tensor,
                      output_tokens_tensor: torch.Tensor,
                      presence_penalties: torch.Tensor,
                      frequency_penalties: torch.Tensor,
                      repetition_penalties: torch.Tensor) -> torch.Tensor:
-    num_seqs, vocab_size = logits.shape
+    num_seqs, vocab_size = logits.shape[0], logits.shape[-1]
     _, prompt_mask = _get_bin_counts_and_mask(prompt_tokens_tensor, vocab_size,
                                               num_seqs)
-    output_bin_counts, output_mask = _get_bin_counts_and_mask(
-        output_tokens_tensor, vocab_size, num_seqs)
+    if sampling_metadata.is_multi_query_mode:
+        assert len(logits.shape) == 3
+        assert sampling_metadata.input_token_ids is not None
+    else:
+        assert len(logits.shape) == 2
 
-    repetition_penalties = repetition_penalties[:, None].repeat(1, vocab_size)
-    repetition_penalties[~(prompt_mask | output_mask)] = 1.0
-    logits = torch.where(logits > 0, logits / repetition_penalties,
-                         logits * repetition_penalties)
+    if sampling_metadata.is_multi_query_mode:
+        # For speculative decoding, all token ids are stored in sampling_metadata.input_token_ids
+        assert sampling_metadata.input_token_ids.shape[
+            1] == sampling_metadata.speculate_length + 1
+        num_tokens = sampling_metadata.input_token_ids.shape[1]
+        output_bin_counts, output_mask = _get_multi_query_bin_counts_and_mask(
+            output_tokens_tensor, sampling_metadata.input_token_ids,
+            vocab_size, num_seqs)
+        repetition_penalties = repetition_penalties[:, None, None].repeat(
+            1, num_tokens, vocab_size)
+        repetition_penalties[~(prompt_mask[:, None, :] | output_mask)] = 1.0
+        logits = torch.where(logits > 0, logits / repetition_penalties,
+                             logits * repetition_penalties)
+        logits -= frequency_penalties[:, None, None] * output_bin_counts
+        logits -= presence_penalties[:, None, None] * output_mask
+    else:
+        output_bin_counts, output_mask = _get_bin_counts_and_mask(
+            output_tokens_tensor, vocab_size, num_seqs)
 
-    # We follow the definition in OpenAI API.
-    # Refer to https://platform.openai.com/docs/api-reference/parameter-details
-    logits -= frequency_penalties.unsqueeze_(dim=1) * output_bin_counts
-    logits -= presence_penalties.unsqueeze_(dim=1) * output_mask
+        repetition_penalties = repetition_penalties[:, None].repeat(
+            1, vocab_size)
+        repetition_penalties[~(prompt_mask | output_mask)] = 1.0
+        logits = torch.where(logits > 0, logits / repetition_penalties,
+                             logits * repetition_penalties)
+
+        # We follow the definition in OpenAI API.
+        # Refer to https://platform.openai.com/docs/api-reference/parameter-details
+        logits -= frequency_penalties.unsqueeze_(dim=1) * output_bin_counts
+        logits -= presence_penalties.unsqueeze_(dim=1) * output_mask
     return logits
 
 
@@ -224,21 +312,34 @@ def _apply_top_k_top_p(
     p: torch.Tensor,
     k: torch.Tensor,
 ) -> torch.Tensor:
+    # logits may have shape [bs, vocab_size] or [bs, num_tokens, vocab_size]
+    assert len(logits.shape) in (2, 3)
     logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
 
     # Apply top-k.
-    top_k_mask = logits_sort.size(1) - k.to(torch.long)
+    top_k_mask = logits_sort.size(-1) - k.to(torch.long)
     # Get all the top_k values.
-    top_k_mask = logits_sort.gather(1, top_k_mask.unsqueeze(dim=1))
+    if len(logits.shape) == 2:
+        top_k_mask = logits_sort.gather(1, top_k_mask.unsqueeze(dim=1))
+    else:
+        # logits has shape [bs, num_tokens, vocab_size]
+        num_tokens = logits.shape[1]
+        top_k_mask = logits_sort.gather(
+            2, top_k_mask[:, None, None].repeat(1, num_tokens, 1))
     top_k_mask = logits_sort < top_k_mask
     logits_sort.masked_fill_(top_k_mask, -float("inf"))
 
     # Apply top-p.
     probs_sort = logits_sort.softmax(dim=-1)
     probs_sum = probs_sort.cumsum(dim=-1)
-    top_p_mask = probs_sum <= 1 - p.unsqueeze(dim=1)
-    # at least one
-    top_p_mask[:, -1] = False
+    if len(logits.shape) == 2:
+        top_p_mask = probs_sum <= 1 - p.unsqueeze(dim=1)
+        # at least one
+        top_p_mask[:, -1] = False
+    else:
+        top_p_mask = probs_sum <= 1 - p.view(-1, 1, 1)
+        # at least one
+        top_p_mask[:, :, -1] = False
     logits_sort.masked_fill_(top_p_mask, -float("inf"))
 
     # Re-sort the probabilities.
@@ -261,7 +362,10 @@ def _apply_min_p(
     """
     probs = torch.softmax(logits, dim=-1)
     top_probs, _ = probs.max(dim=-1, keepdim=True)
-    scaled_min_p = min_p.unsqueeze_(dim=1) * top_probs
+    if len(logits.shape) == 2:
+        scaled_min_p = min_p.unsqueeze_(dim=1) * top_probs
+    else:
+        scaled_min_p = min_p.view(-1, 1, 1) * top_probs
     tokens_to_remove = probs < scaled_min_p
     logits = logits.masked_fill_(tokens_to_remove, -float("inf"))
 

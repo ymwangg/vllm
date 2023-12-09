@@ -7,6 +7,7 @@ import contextlib
 from typing import Optional
 
 import torch
+import enum
 
 import vllm.envs as envs
 from vllm.logger import init_logger
@@ -16,6 +17,16 @@ logger = init_logger(__name__)
 # Tensor model parallel group that the current rank belongs to.
 _TP_DEVICE_GROUP = None
 _TP_CPU_GROUP = None
+
+class ActiveModel(enum.Enum):
+    TARGET = enum.auto()
+    DRAFT = enum.auto()
+
+
+# Tensor model parallel group that the current rank belongs to.
+_TENSOR_MODEL_PARALLEL_GROUP = None
+# Draft model tensor parallel group for speculative decoding
+_DRAFT_MODEL_TP_GROUP = None
 # Pipeline model parallel group that the current rank belongs to.
 _PIPELINE_MODEL_PARALLEL_GROUP = None
 
@@ -84,12 +95,32 @@ def init_distributed_environment(
             local_rank = envs.LOCAL_RANK
         global _LOCAL_RANK
         _LOCAL_RANK = local_rank
+_ACTIVE_MODEL: ActiveModel = ActiveModel.TARGET
+
+
+# This context manager is used to mark which model
+# is currently active so that the corresponding distributed group can be selected.
+@contextlib.contextmanager
+def MarkActiveModel(new_value):
+    global _ACTIVE_MODEL
+
+    # Save the original value
+    original_value = _ACTIVE_MODEL
+
+    try:
+        # Temporarily change the global variable
+        _ACTIVE_MODEL = new_value
+        yield
+    finally:
+        # Restore the original value after the block
+        _ACTIVE_MODEL = original_value
 
 
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
     backend: Optional[str] = None,
+    draft_model_tp_size: Optional[int] = None,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -99,6 +130,8 @@ def initialize_model_parallel(
             parallelism.
         pipeline_model_parallel_size: number of GPUs used for pipeline model
             parallelism.
+        draft_model_tp_size: number of GPUs used for draft model's tensor
+            model parallelism.
 
     Let's say we have a total of 8 GPUs denoted by g0 ... g7 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -157,11 +190,25 @@ def initialize_model_parallel(
             _PIPELINE_MODEL_PARALLEL_GROUP = group
             _PIPELINE_GLOBAL_RANKS = ranks
 
+    # Build the tensor parallel groups for draft model
+    global _DRAFT_MODEL_TP_GROUP
+    if draft_model_tp_size:
+        assert _DRAFT_MODEL_TP_GROUP is None, (
+            "draft model tensor parallel group is already initialized")
+        # place draft model on the first n devices
+        num_draft_model_group = tensor_model_parallel_size//draft_model_tp_size
+        for i in range(num_draft_model_group):
+            ranks = range(i, world_size, num_draft_model_group)
+            group = torch.distributed.new_group(ranks)
+            if rank in ranks:
+               _DRAFT_MODEL_TP_GROUP = group
+
 
 def ensure_model_parallel_initialized(
     tensor_model_parallel_size: int,
     pipeline_model_parallel_size: int,
     backend: Optional[str] = None,
+    draft_model_tp_size: Optional[int] = None,
 ) -> None:
     """Helper to initialize model parallel groups if they are not initialized,
     or ensure tensor-parallel and pipeline-parallel sizes are equal to expected
@@ -171,7 +218,9 @@ def ensure_model_parallel_initialized(
     backend = backend or torch.distributed.get_backend()
     if not model_parallel_is_initialized():
         initialize_model_parallel(tensor_model_parallel_size,
-                                  pipeline_model_parallel_size, backend)
+                                  pipeline_model_parallel_size,
+                                  backend
+                                  draft_model_tp_size)
         return
 
     assert (
