@@ -78,6 +78,7 @@ class SamplingTensors:
     repetition_penalties: torch.Tensor
     prompt_tokens: torch.Tensor
     output_tokens: torch.Tensor
+    greedy_flags: torch.Tensor
 
     @classmethod
     def from_sampling_metadata(
@@ -93,9 +94,11 @@ class SamplingTensors:
         presence_penalties: List[float] = []
         frequency_penalties: List[float] = []
         repetition_penalties: List[float] = []
+        greedy_flags: List[bool] = []
         do_penalties = False
         do_top_p_top_k = False
         do_min_p = False
+        do_greedy = False
         for i, seq_group in enumerate(sampling_metadata.seq_groups):
             seq_ids, sampling_params = seq_group
             temperature = sampling_params.temperature
@@ -107,11 +110,14 @@ class SamplingTensors:
             # k should not be greater than the vocab size.
             top_k = min(sampling_params.top_k, vocab_size)
             top_k = vocab_size if top_k == -1 else top_k
+            greedy_flag = False
             if temperature < _SAMPLING_EPS:
                 # NOTE: Zero temperature means deterministic sampling
                 # (i.e., greedy sampling or beam search).
                 # Set the temperature to 1 to avoid division by zero.
                 temperature = 1.0
+                greedy_flag = True
+                do_greedy = True
             if not do_top_p_top_k and (top_p < 1.0 - _SAMPLING_EPS
                                        or top_k != vocab_size):
                 do_top_p_top_k = True
@@ -148,12 +154,14 @@ class SamplingTensors:
             presence_penalties += [p] * len(seq_ids)
             frequency_penalties += [f] * len(seq_ids)
             repetition_penalties += [r] * len(seq_ids)
+            greedy_flags += [greedy_flag] * len(seq_ids)
 
         sampling_tensors = SamplingTensors.from_lists(
             temperatures, top_ps, top_ks, min_ps, presence_penalties,
             frequency_penalties, repetition_penalties, prompt_tokens,
-            output_tokens, vocab_size, device, dtype)
-        return (sampling_tensors, do_penalties, do_top_p_top_k, do_min_p)
+            output_tokens, greedy_flags, vocab_size, device, dtype)
+        return (sampling_tensors, do_penalties, do_top_p_top_k, do_min_p,
+                do_greedy)
 
     @classmethod
     def from_lists(cls, temperatures: List[float], top_ps: List[float],
@@ -162,7 +170,8 @@ class SamplingTensors:
                    frequency_penalties: List[float],
                    repetition_penalties: List[float],
                    prompt_tokens: List[List[int]],
-                   output_tokens: List[List[int]], vocab_size: int,
+                   output_tokens: List[List[int]],
+                   greedy_flags: List[List[int]], vocab_size: int,
                    device: torch.device,
                    dtype: torch.dtype) -> "SamplingTensors":
         # Note that the performance will be very bad without
@@ -233,6 +242,12 @@ class SamplingTensors:
             dtype=torch.long,
             pin_memory=pin_memory,
         )
+        greedy_flags_tensor = torch.tensor(
+            greedy_flags,
+            device="cpu",
+            dtype=torch.bool,
+            pin_memory=pin_memory,
+        )
         # Because the memory is pinned, we can do non-blocking
         # transfer to device.
         return cls(
@@ -248,4 +263,6 @@ class SamplingTensors:
                                                            non_blocking=True),
             prompt_tokens=prompt_tensor.to(device=device, non_blocking=True),
             output_tokens=output_tensor.to(device=device, non_blocking=True),
+            greedy_flags=greedy_flags_tensor.to(device=device,
+                                                non_blocking=True),
         )

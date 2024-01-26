@@ -83,8 +83,8 @@ class Sampler(nn.Module):
         logits = _apply_logits_processors(logits, sampling_metadata)
 
         # Prepare sampling tensors with pinned memory to avoid blocking.
-        (sampling_tensors, do_penalties, do_top_p_top_k,
-         do_min_p) = SamplingTensors.from_sampling_metadata(
+        (sampling_tensors, do_penalties, do_top_p_top_k, do_min_p,
+         do_greedy) = SamplingTensors.from_sampling_metadata(
              sampling_metadata, vocab_size, logits.device, logits.dtype)
 
         # Apply presence and frequency penalties.
@@ -115,7 +115,8 @@ class Sampler(nn.Module):
         if sampling_metadata.is_multi_query_mode:
             # Run rejection sampling algorithm in speculative decoding.
             sample_results, logprobs, num_accepted_list = _reject_sample(
-                probs, sampling_metadata)
+                probs, sampling_metadata, do_greedy,
+                sampling_tensors.greedy_flags)
             # Get the logprobs query results.
             prompt_logprobs, sample_logprobs = _get_logprobs(
                 logprobs, sampling_metadata, sample_results)
@@ -346,7 +347,10 @@ def _apply_min_p(
     """
     probs = torch.softmax(logits, dim=-1)
     top_probs, _ = probs.max(dim=-1, keepdim=True)
-    scaled_min_p = min_p.unsqueeze_(dim=1) * top_probs
+    if len(logits.shape) == 2:
+        scaled_min_p = min_p.unsqueeze_(dim=1) * top_probs
+    else:
+        scaled_min_p = min_p.view(-1, 1, 1) * top_probs
     tokens_to_remove = probs < scaled_min_p
     logits = logits.masked_fill_(tokens_to_remove, -float("inf"))
 
@@ -689,6 +693,8 @@ def _build_sampler_output(
 def _reject_sample(
     target_token_probs: torch.Tensor,
     sampling_metadata: SamplingMetadata,
+    do_greedy: bool = False,
+    greedy_flags: Optional[torch.Tensor] = None,
 ) -> Tuple[List[Tuple[List[int], List[int]]], torch.Tensor, List]:
     # Rejection sampling algorithm described in https://arxiv.org/abs/2302.01318
     assert sampling_metadata.draft_token_ids is not None
@@ -708,11 +714,19 @@ def _reject_sample(
     random_values = torch.rand(size=(confidence.shape[-1], ),
                                dtype=confidence.dtype,
                                device=confidence.device)
-    is_accepted = confidence > random_values
+    is_match = confidence > random_values
+    if do_greedy:
+        assert greedy_flags is not None
+        num_draft_tokens = draft_token_ids.shape[-1]
+        is_greedy_match = torch.argmax(
+            target_token_probs, -1)[:, :num_draft_tokens] == draft_token_ids
+        is_match = torch.where(
+            greedy_flags[:, None].expand(-1, num_draft_tokens),
+            is_greedy_match, is_match)
     # For the convenience of handling the case when all tokens are accepted, we pad
     # the acceptance matrix's shape from [bsz, n_draft] to [bsz, n_draft+1].
-    is_accepted = torch.nn.functional.pad(is_accepted, (0, 1), value=False)
-    num_accepted = torch.argmin(is_accepted.to(torch.int), axis=-1)
+    is_match = torch.nn.functional.pad(is_match, (0, 1), value=False)
+    num_accepted = torch.argmin(is_match.to(torch.int), axis=-1)
     # 4. Construct next token probs. Note num_acceped has shape [bsz] and
     # gather_indices has shape[bsz, 1, vocab_size].
     # Here we set the vocab size to be whichever smaller when the draft model
