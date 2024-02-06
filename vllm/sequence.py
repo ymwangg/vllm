@@ -472,6 +472,41 @@ class SequenceOutput:
                 and self.logprobs == other.logprobs)
 
 
+class SpeculateSequenceOutput:
+    """The model output associated with a sequence with multiple generated
+       tokens.
+
+    Args:
+        parent_seq_id: The ID of the parent sequence (for forking in beam
+            search).
+        output_tokens: The output tokens ID.
+        logprobs_list: The list of logprobs of each output token
+            List[(Token id -> logP(x_i+1 | x_0, ..., x_i))].
+        num_accepted_tokens: The number of accepted tokens.
+        parent_probs: The logprobs of parent token. This is useful for
+            speculative decoding.
+    """
+
+    def __init__(
+        self,
+        parent_seq_id: int,
+        output_tokens: List[int],
+        logprobs_list: List[Dict[int, float]],
+        num_accepted_tokens: int,
+        parent_probs: List[Optional[torch.Tensor]] = None,
+    ) -> None:
+        self.parent_seq_id = parent_seq_id
+        self.output_tokens = output_tokens
+        self.logprobs_list = logprobs_list
+        self.num_accepted_tokens = num_accepted_tokens
+        self.parent_probs = parent_probs
+
+    def __repr__(self) -> str:
+        return (f"SequenceOutput(parent_seq_id={self.parent_seq_id}, "
+                f"output_tokens={self.output_tokens}, "
+                f"logprobs_list={self.logprobs_list})")
+
+
 class SequenceGroupOutput:
     """The model output associated with a sequence group."""
 
@@ -514,11 +549,13 @@ class SpeculateSequenceGroupOutput:
         output_tokens: List[int],
         logprobs: List[Dict[int, float]],
         num_accepted_tokens: int,
+        prompt_logprobs: Optional[PromptLogprobs] = None,
     ) -> None:
         self.parent_seq_id = parent_seq_id
         self.output_tokens = output_tokens
         self.logprobs = logprobs
         self.num_accepted_tokens = num_accepted_tokens
+        self.prompt_logprobs = prompt_logprobs
 
     def __repr__(self) -> str:
         return (
@@ -532,3 +569,4 @@ class SpeculateSequenceGroupOutput:
 # each of which contains one possible candidate for the next token.
 SamplerOutput = List[SequenceGroupOutput]
 SpeculateOutput = List[SpeculateSequenceGroupOutput]
+SpeculateSamplerOutput = List[SpeculateSequenceOutput]

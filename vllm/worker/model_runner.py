@@ -123,7 +123,8 @@ class ModelRunner:
             with MarkActiveModel(ActiveModel.DRAFT):
                 # NOTE: We use global variable to control parallel state (world size, rank)
                 # of draft model used in speculative decoding.
-                self.draft_model = get_model(self.draft_model_config, self.device_config)
+                self.draft_model = get_model(self.draft_model_config,
+                                             self.device_config)
 
     def set_block_size(self, block_size: int) -> None:
         self.block_size = block_size
@@ -868,11 +869,17 @@ class ModelRunner:
         # happen.
         # FIXME(woosuk): This is a bit hacky. Find a more robust solution.
         self.graph_runners.clear()
+        if self.use_speculate:
+            self.d_graph_runners.clear()
         self.cupy_nccl_backend = None
 
     @torch.inference_mode()
     def speculate_capture_model(self, kv_caches: List[KVCache],
                                 draft_kv_caches: List[KVCache]) -> None:
+        # NOTE(woosuk): This is a hack to ensure that the NCCL backend is never
+        # deleted before the CUDA graphs.
+        self.cupy_nccl_backend = cupy_utils.get_nccl_backend()
+
         assert not self.model_config.enforce_eager
         self.log_cudagraph_warning()
         start_time = time.perf_counter()
@@ -915,37 +922,44 @@ class ModelRunner:
 
             # NOTE: Capturing the largest batch size first may help reduce the
             # memory usage of CUDA graph.
-            for batch_size in reversed(batch_size_capture_list):
-                # Create dummy input_metadata.
-                input_metadata = InputMetadata(
-                    is_prompt=False,
-                    slot_mapping=slot_mapping[:batch_size],
-                    prompt_lens=None,
-                    max_seq_len=None,
-                    start_loc=None,
-                    max_context_len=self.max_context_len_to_capture,
-                    context_lens=context_lens[:batch_size],
-                    block_tables=block_tables[:batch_size],
-                    use_cuda_graph=True,
-                    kv_cache_dtype=self.kv_cache_dtype,
-                    is_multi_query_mode=is_multi_query_mode,
-                )
-                graph_runner = CUDAGraphRunner(self.draft_model) if is_draft_model \
-                    else CUDAGraphRunner(self.model)
-                with MarkActiveModel(active_model):
-                    graph_runner.capture(
-                        input_tokens[:batch_size],
-                        input_positions[:batch_size],
-                        caches,
-                        input_metadata,
-                        memory_pool=graph_memory_pool,
+            # NOTE(woosuk): There are 3 backends for all-reduce: custom all-reduce
+            # kernel, CuPy NCCL, and PyTorch NCCL. When using CUDA graph, we use
+            # either custom all-reduce kernel or CuPy NCCL. When not using CUDA
+            # graph, we use either custom all-reduce kernel or PyTorch NCCL.
+            # We always prioritize using custom all-reduce kernel but fall back
+            # to PyTorch or CuPy NCCL if it is disabled or not supported.
+            with custom_all_reduce.capture():
+                for batch_size in reversed(batch_size_capture_list):
+                    # Create dummy input_metadata.
+                    input_metadata = InputMetadata(
+                        is_prompt=False,
+                        slot_mapping=slot_mapping[:batch_size],
+                        prompt_lens=None,
+                        max_seq_len=None,
+                        start_loc=None,
+                        max_context_len=self.max_context_len_to_capture,
+                        context_lens=context_lens[:batch_size],
+                        block_tables=block_tables[:batch_size],
+                        use_cuda_graph=True,
+                        kv_cache_dtype=self.kv_cache_dtype,
+                        is_multi_query_mode=is_multi_query_mode,
                     )
-                graph_memory_pool = graph_runner.graph.pool()
-                graph_runners[batch_size] = graph_runner
-            if is_draft_model:
-                self.d_graph_memory_pool = graph_memory_pool
-            else:
-                self.graph_memory_pool = graph_memory_pool
+                    graph_runner = CUDAGraphRunner(self.draft_model) if is_draft_model \
+                        else CUDAGraphRunner(self.model)
+                    with MarkActiveModel(active_model):
+                        graph_runner.capture(
+                            input_tokens[:batch_size],
+                            input_positions[:batch_size],
+                            caches,
+                            input_metadata,
+                            memory_pool=graph_memory_pool,
+                        )
+                    graph_memory_pool = graph_runner.graph.pool()
+                    graph_runners[batch_size] = graph_runner
+                if is_draft_model:
+                    self.d_graph_memory_pool = graph_memory_pool
+                else:
+                    self.graph_memory_pool = graph_memory_pool
 
         # 1. Capture draft model
         if self.rank < self.parallel_config.draft_model_tp_size:
@@ -1014,48 +1028,48 @@ class ModelRunner:
 
         for seq_group_metadata, seq_group_output in zip(
                 seq_group_metadata_list, output):
-            samples = seq_group_output.samples
-            assert len(
-                samples
-            ) == 1, "Speculative decoding only allows one seq per seq group."
-            sample = samples[0]
-            seq_id = sample.parent_seq_id
-            seq_data = seq_group_metadata.seq_data[seq_id]
-            if is_draft_model:
-                # Post-process tokens generated by draft model.
+            # 1. Handling the case when multiple tokens can be generated.
+            if sampling_metadata.is_multi_query_mode:
+                # Here we drop the last sampled token when all draft tokens were accepted.
+                # When all draft tokens were accepted, the last 2 generated tokens (the last
+                # accepted draft token plus the token sampled from its logits) will miss
+                # their kv caches in the draft model and requires multi-query attention.
+                # Mixing single query and multi-query attention is currently not supported.
+                seq_id = seq_group_output.parent_seq_id
+                num_accepted = seq_group_output.num_accepted_tokens
+                max_num_generated_tokens = min(
+                    num_accepted + 1, sampling_metadata.speculate_length)
+                output_tokens = seq_group_output.output_tokens[:
+                                                               max_num_generated_tokens]
+                output_token_logprobs = seq_group_output.logprobs_list[:
+                                                                       max_num_generated_tokens]
+                speculate_outputs.append(
+                    SpeculateSequenceGroupOutput(seq_id,
+                                                 output_tokens,
+                                                 output_token_logprobs,
+                                                 num_accepted,
+                                                 prompt_logprobs=None))
+            # 2. Handling the case when only 1 token can be generated.
+            else:
+                samples = seq_group_output.samples
+                assert len(
+                    samples
+                ) == 1, "Speculative decoding only allows one seq per seq group."
+                sample = samples[0]
+                seq_id = sample.parent_seq_id
                 parent_probs = sample.parent_probs
                 token_id = sample.output_token
-                seq_data.append_draft_token(token_id,
-                                            sample.logprobs[token_id],
-                                            parent_probs)
-            else:
-                # Post-process tokens generated by target model.
-                output_tokens = []
-                output_token_logprobs = []
-                num_accepted = seq_group_output.num_accepted_tokens
-                if num_accepted is not None and num_accepted > 0:
-                    all_tokens_accepted = (
-                        num_accepted == seq_data.get_num_draft_tokens())
-                    for draft_token in seq_data.draft_tokens[:num_accepted]:
-                        token_id = draft_token.token_id
-                        logprobs = {token_id: draft_token.logprob}
-                        output_tokens.append(token_id)
-                        output_token_logprobs.append(logprobs)
-                    # Here we drop the last sampled token when all draft tokens were accepted.
-                    # When all draft tokens were accepted, the last 2 generated tokens (the last
-                    # accepted draft token plus the token sampled from its logits) will miss
-                    # their kv caches in the draft model and requires multi-query attention.
-                    # Mixing single query and multi-query attention is currently not supported.
-                    if not all_tokens_accepted:
-                        output_tokens.append(sample.output_token)
-                        output_token_logprobs.append(sample.logprobs)
+                logprobs_dict = sample.logprobs
+                if is_draft_model:
+                    seq_data = seq_group_metadata.seq_data[seq_id]
+                    seq_data.append_draft_token(token_id,
+                                                logprobs_dict[token_id],
+                                                parent_probs)
                 else:
-                    output_tokens.append(sample.output_token)
-                    output_token_logprobs.append(sample.logprobs)
-                speculate_outputs.append(
-                    SpeculateSequenceGroupOutput(seq_id, output_tokens,
-                                                 output_token_logprobs,
-                                                 num_accepted))
+                    speculate_outputs.append(
+                        SpeculateSequenceGroupOutput(
+                            seq_id, [token_id], [logprobs_dict], 0,
+                            seq_group_output.prompt_logprobs))
         return speculate_outputs
 
     def clear_draft_tokens(

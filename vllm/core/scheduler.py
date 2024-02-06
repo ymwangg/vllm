@@ -311,7 +311,8 @@ class Scheduler:
         num_padded_tokens = self.speculate_length + 1 if self.use_speculate else 1
         while self.running:
             seq_group = self.running.popleft()
-            while not self.block_manager.can_append_slot(seq_group):
+            while not self.block_manager.can_append_multiple_slots(
+                    seq_group, num_padded_tokens):
                 if self.running:
                     # Preempt the lowest-priority sequence groups.
                     victim_seq_group = self.running.pop()
@@ -522,7 +523,8 @@ class Scheduler:
     ) -> None:
         if self.use_speculate:
             raise AssertionError(
-                "Preemption by swap is not supported when using speculative decoding.")
+                "Preemption by swap is not supported when using speculative decoding."
+            )
         self._swap_out(seq_group, blocks_to_swap_out)
         self.swapped.append(seq_group)
 

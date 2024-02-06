@@ -10,14 +10,13 @@ import enum
 
 from typing import Optional
 from contextlib import contextmanager
+from vllm.model_executor.parallel_utils import cupy_utils
 
 
 class ActiveModel(enum.Enum):
     TARGET = enum.auto()
     DRAFT = enum.auto()
 
-
-from vllm.model_executor.parallel_utils import cupy_utils
 
 # Tensor model parallel group that the current rank belongs to.
 _TENSOR_MODEL_PARALLEL_GROUP = None
@@ -56,7 +55,6 @@ def initialize_model_parallel(
     pipeline_model_parallel_size: int = 1,
     draft_model_tp_size: Optional[int] = None,
 ) -> None:
-    # TODO: Fix docstring
     """
     Initialize model parallel groups.
 
@@ -262,6 +260,8 @@ def destroy_model_parallel():
     global _PIPELINE_GLOBAL_RANKS
     _PIPELINE_GLOBAL_RANKS = None
     global _DRAFT_MODEL_TP_GROUP
+    if _DRAFT_MODEL_TP_GROUP:
+        torch.distributed.destroy_process_group(_DRAFT_MODEL_TP_GROUP)
     _DRAFT_MODEL_TP_GROUP = None
 
     # Destroy the cupy states if any.

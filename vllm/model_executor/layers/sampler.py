@@ -9,7 +9,8 @@ from vllm.model_executor.parallel_utils.communication_op import (
 from vllm.model_executor.sampling_metadata import SamplingMetadata, SamplingTensors
 from vllm.sampling_params import SamplingParams, SamplingType
 from vllm.sequence import (PromptLogprobs, SampleLogprobs, SamplerOutput,
-                           SequenceData, SequenceGroupOutput, SequenceOutput)
+                           SequenceData, SequenceGroupOutput, SequenceOutput,
+                           SpeculateSequenceOutput, SpeculateSamplerOutput)
 
 
 class Sampler(nn.Module):
@@ -112,24 +113,18 @@ class Sampler(nn.Module):
         # We use float32 for probabilities and log probabilities.
         # Compute the probabilities.
         probs = torch.softmax(logits, dim=-1, dtype=torch.float)
+        # Compute the log probabilities.
+        # Use log_softmax to ensure numerical stability.
+        logprobs = torch.log_softmax(logits, dim=-1, dtype=torch.float)
         if sampling_metadata.is_multi_query_mode:
             # Run rejection sampling algorithm in speculative decoding.
-            sample_results, logprobs, num_accepted_list = _reject_sample(
-                probs, sampling_metadata, do_greedy,
+            sampled_token_ids, num_accepted = _reject_sample(
+                probs, logprobs, sampling_metadata, do_greedy,
                 sampling_tensors.greedy_flags)
-            # Get the logprobs query results.
-            prompt_logprobs, sample_logprobs = _get_logprobs(
-                logprobs, sampling_metadata, sample_results)
-            out = _build_sampler_output(sample_results,
-                                        sampling_metadata,
-                                        prompt_logprobs,
-                                        sample_logprobs,
-                                        num_accepted_list=num_accepted_list)
+            out = _build_reject_sampler_output(logprobs, sampling_metadata,
+                                               sampled_token_ids, num_accepted)
             return out
         else:
-            # Compute the log probabilities.
-            # Use log_softmax to ensure numerical stability.
-            logprobs = torch.log_softmax(logits, dim=-1, dtype=torch.float)
             # Sample the next tokens.
             sample_results = _sample(probs, logprobs, sampling_metadata)
             # Get the logprobs query results.
@@ -692,11 +687,11 @@ def _build_sampler_output(
 
 def _reject_sample(
     target_token_probs: torch.Tensor,
+    target_token_logprobs: torch.Tensor,
     sampling_metadata: SamplingMetadata,
     do_greedy: bool = False,
     greedy_flags: Optional[torch.Tensor] = None,
 ) -> Tuple[List[Tuple[List[int], List[int]]], torch.Tensor, List]:
-    # Rejection sampling algorithm described in https://arxiv.org/abs/2302.01318
     assert sampling_metadata.draft_token_ids is not None
     assert sampling_metadata.draft_token_probs is not None
     draft_token_ids = sampling_metadata.draft_token_ids
@@ -716,10 +711,11 @@ def _reject_sample(
                                device=confidence.device)
     is_match = confidence > random_values
     if do_greedy:
+        # Special treatment for greedy sampling
         assert greedy_flags is not None
         num_draft_tokens = draft_token_ids.shape[-1]
         is_greedy_match = torch.argmax(
-            target_token_probs, -1)[:, :num_draft_tokens] == draft_token_ids
+            target_token_logprobs, -1)[:, :num_draft_tokens] == draft_token_ids
         is_match = torch.where(
             greedy_flags[:, None].expand(-1, num_draft_tokens),
             is_greedy_match, is_match)
@@ -727,21 +723,94 @@ def _reject_sample(
     # the acceptance matrix's shape from [bsz, n_draft] to [bsz, n_draft+1].
     is_match = torch.nn.functional.pad(is_match, (0, 1), value=False)
     num_accepted = torch.argmin(is_match.to(torch.int), axis=-1)
-    # 4. Construct next token probs. Note num_acceped has shape [bsz] and
-    # gather_indices has shape[bsz, 1, vocab_size].
+    # 4. Construct next token probs and sample next token. Note num_acceped
+    # has shape [bsz] and gather_indices has shape[bsz, 1, vocab_size].
     # Here we set the vocab size to be whichever smaller when the draft model
     # has different vocab size than the target model.
     vocab_size = min(draft_token_probs.shape[-1], target_token_probs.shape[-1])
     gather_indices = num_accepted[:, None, None].expand(-1, 1, vocab_size)
+    # Run rejection sampling algorithm described in https://arxiv.org/abs/2302.01318
+    p = torch.gather(target_token_probs, 1, gather_indices).squeeze(1)
     q = torch.gather(draft_token_probs, 1, gather_indices).squeeze(1)
     # For numerical stability, convert nans in draft ptobs to 0.
     q.nan_to_num_(0, 0, 0)
-    p = torch.gather(target_token_probs, 1, gather_indices).squeeze(1)
     diff = p - q
     diff.clamp_(min=0)
     probs = diff / torch.sum(diff, axis=-1).view(-1, 1)
-    logprobs = torch.log(probs)
-    num_accepted_list = num_accepted.tolist()
-    # 5. Sample next token.
-    sample_results = _sample(probs, logprobs, sampling_metadata)
-    return (sample_results, logprobs, num_accepted_list)
+    sampled_token_ids = _multinomial(probs, 1).squeeze(-1)
+    if do_greedy:
+        # Special treatment for greedy sampling
+        logprobs = torch.gather(target_token_logprobs, 1,
+                                gather_indices).squeeze(1)
+        greedy_sampled_token_ids = torch.argmax(logprobs, dim=-1)
+        sampled_token_ids = torch.where(greedy_flags, greedy_sampled_token_ids,
+                                        sampled_token_ids)
+    return sampled_token_ids, num_accepted
+
+
+def _build_reject_sampler_output(
+        target_token_logprobs: torch.Tensor,
+        sampling_metadata: SamplingMetadata, sampled_token_ids: torch.Tensor,
+        num_accepted_tokens: torch.Tensor) -> SpeculateSamplerOutput:
+    largest_num_logprobs = 0
+    gather_indices = sampling_metadata.draft_token_ids.unsqueeze(-1)
+    # shape: [bsz, seq_len]
+    logprob_matrix = torch.gather(target_token_logprobs, -1,
+                                  gather_indices).squeeze(-1).tolist()
+    # shape: [bsz, seq_len]
+    draft_token_ids = sampling_metadata.draft_token_ids.tolist()
+    # shape: [bsz]
+    sampled_token_ids = sampled_token_ids.tolist()
+    batch_arange = torch.arange(target_token_logprobs.size(0))
+    # shape: [bsz]
+    sampled_token_logprob = target_token_logprobs[batch_arange,
+                                                  num_accepted_tokens,
+                                                  sampled_token_ids].tolist()
+    # shape: [bsz]
+    num_accepted_tokens = num_accepted_tokens.tolist()
+
+    outputs = []
+    # Process generated tokens and their logprob.
+    for sample_idx, (seq_ids, sampling_params) in enumerate(
+            sampling_metadata.seq_groups):
+        assert len(seq_ids) == 1
+
+        num_accepted = num_accepted_tokens[sample_idx]
+        accepted_token_ids = draft_token_ids[sample_idx][:num_accepted]
+        logprob_list = logprob_matrix[sample_idx][:num_accepted]
+        gen_token_ids = accepted_token_ids + [sampled_token_ids[sample_idx]]
+        gen_token_logprob_list = logprob_list + \
+            [sampled_token_logprob[sample_idx]]
+        logprobs_dict_list = [{
+            token_id: logprob
+        } for token_id, logprob in zip(gen_token_ids, gen_token_logprob_list)]
+        outputs.append(
+            SpeculateSequenceOutput(sample_idx, gen_token_ids,
+                                    logprobs_dict_list, num_accepted))
+        if sampling_params.logprobs is not None:
+            largest_num_logprobs = max(largest_num_logprobs,
+                                       sampling_params.logprobs)
+    # Update logprobs dict in case largest_num_logprobs > 0.
+    if largest_num_logprobs > 0:
+        top_logprobs, top_token_ids = torch.topk(target_token_logprobs,
+                                                 largest_num_logprobs,
+                                                 dim=-1)
+        # shape: [bsz, seq_len, largest_num_logprobs]
+        top_logprobs = top_logprobs.cpu()
+        # shape: [bsz, seq_len, largest_num_logprobs]
+        top_token_ids = top_token_ids.cpu()
+        for sample_idx, (_, sampling_params) in enumerate(
+                sampling_metadata.seq_groups):
+            num_logprobs = sampling_params.logprobs
+            if num_logprobs:
+                num_accepted = num_accepted_tokens[sample_idx]
+                logprobs_dict_list = outputs[sample_idx].logprobs_list
+                for position in range(num_accepted + 1):
+                    logprobs_dict = logprobs_dict_list[position]
+                    selected_top_logprobs = top_logprobs[
+                        sample_idx, position, :num_logprobs].tolist()
+                    selected_top_token_ids = top_token_ids[
+                        sample_idx, position, :num_logprobs].tolist()
+                    logprobs_dict.update(
+                        zip(selected_top_token_ids, selected_top_logprobs))
+    return outputs

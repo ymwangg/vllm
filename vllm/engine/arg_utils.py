@@ -376,8 +376,8 @@ class EngineArgs:
             max_cpu_loras=self.max_cpu_loras if self.max_cpu_loras
             and self.max_cpu_loras > 0 else None) if self.enable_lora else None
         return EngineConfig(model_config, cache_config, parallel_config,
-                            scheduler_config, device_config, lora_config, draft_model_config,
-                            self.speculate_length)
+                            scheduler_config, device_config, lora_config,
+                            draft_model_config, self.speculate_length)
 
 
 @dataclass
