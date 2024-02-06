@@ -499,9 +499,6 @@ class Scheduler:
             self._preempt_by_swap(seq_group, blocks_to_swap_out)
         else:
             raise AssertionError("Invalid preemption mode.")
-        if self.use_speculate:
-            raise AssertionError(
-                "Preemption is not supported when using speculative decoding.")
 
     def _preempt_by_recompute(
         self,
@@ -512,6 +509,8 @@ class Scheduler:
         for seq in seqs:
             seq.status = SequenceStatus.WAITING
             self.block_manager.free(seq)
+            if self.use_speculate:
+                self.d_block_manager.free(seq)
         # NOTE: For FCFS, we insert the preempted sequence group to the front
         # of the waiting queue.
         self.waiting.appendleft(seq_group)
@@ -521,6 +520,9 @@ class Scheduler:
         seq_group: SequenceGroup,
         blocks_to_swap_out: Dict[int, int],
     ) -> None:
+        if self.use_speculate:
+            raise AssertionError(
+                "Preemption by swap is not supported when using speculative decoding.")
         self._swap_out(seq_group, blocks_to_swap_out)
         self.swapped.append(seq_group)
 
