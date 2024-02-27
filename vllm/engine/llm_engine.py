@@ -763,6 +763,11 @@ class LLMEngine:
     def _process_speculate_sequence_group_outputs(
             self, seq_group: SequenceGroup,
             outputs: SpeculateSequenceGroupOutput) -> None:
+        # Process prompt logprobs
+        prompt_logprobs = outputs.prompt_logprobs
+        if prompt_logprobs is not None:
+            seq_group.prompt_logprobs = prompt_logprobs
+        # Process samples
         seqs = seq_group.get_seqs(status=SequenceStatus.RUNNING)
         assert len(
             seqs
@@ -972,6 +977,7 @@ class LLMEngine:
         seq.prefix_offset = prefix_offset
         seq.read_offset = read_offset
         seq.output_text += new_output_text
+        self.new_output_text = new_output_text
         # Update seq.new_token_start_loc to support decoding multiple tokens in one step.
         seq.mark_decode_step()
 
@@ -979,10 +985,21 @@ class LLMEngine:
                     sampling_params: SamplingParams) -> None:
         """Stop the finished sequences."""
         for stop_str in sampling_params.stop:
-            if seq.output_text.endswith(stop_str):
-                self._finalize_sequence(seq, sampling_params, stop_str)
-                seq.status = SequenceStatus.FINISHED_STOPPED
-                return
+            if self.use_speculate:
+                # Speculate decoding may generate multiple tokens
+                num_new_chars = len(seq.output_text)
+                num_chars = len(seq.output_text)
+                for offset in range(num_chars-num_new_chars, num_chars):
+                    if seq.output_text[:offset].endswith(stop_str):
+                        seq.output_text = seq.output_text[:offset]
+                        self._finalize_sequence(seq, sampling_params, stop_str)
+                        seq.status = SequenceStatus.FINISHED_STOPPED
+                        return
+            else:
+                if seq.output_text.endswith(stop_str):
+                    self._finalize_sequence(seq, sampling_params, stop_str)
+                    seq.status = SequenceStatus.FINISHED_STOPPED
+                    return
 
         offset = self.speculate_length + 1 if self.use_speculate else 1
         for token in seq.data.output_token_ids[-offset:]:
