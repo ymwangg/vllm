@@ -76,6 +76,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     &reshape_and_cache,
     "Reshape the key and value tensors and cache them");
   cache_ops.def(
+    "reshape_and_cache_flash_layout",
+    &reshape_and_cache_flash_layout,
+    "Reshape the key and value tensors and cache them");
+  cache_ops.def(
     "gather_cached_kv",
     &gather_cached_kv,
     "Gather key and value from the cache into contiguous QKV tensors");

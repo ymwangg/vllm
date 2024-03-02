@@ -26,10 +26,12 @@ class CacheEngine:
         cache_config: CacheConfig,
         model_config: ModelConfig,
         parallel_config: ParallelConfig,
+        layout: str = "vllm",
     ) -> None:
         self.cache_config = cache_config
         self.model_config = model_config
         self.parallel_config = parallel_config
+        self.layout = layout
 
         self.head_size = model_config.get_head_size()
         self.num_layers = model_config.get_num_layers(parallel_config)
@@ -55,21 +57,35 @@ class CacheEngine:
         self.events = [torch.cuda.Event() for _ in range(self.num_layers)]
 
     def get_key_block_shape(self) -> Tuple[int, int, int, int]:
-        element_size = torch.tensor([], dtype=self.dtype).element_size()
-        x = 16 // element_size
-        return (
-            self.num_heads,
-            self.head_size // x,
-            self.block_size,
-            x,
-        )
+        if self.layout == "flash":
+            return (
+                self.block_size,
+                self.num_heads,
+                self.head_size,
+            )
+        else:
+            element_size = torch.tensor([], dtype=self.dtype).element_size()
+            x = 16 // element_size
+            return (
+                self.num_heads,
+                self.head_size // x,
+                self.block_size,
+                x,
+            )
 
     def get_value_block_shape(self) -> Tuple[int, int, int]:
-        return (
-            self.num_heads,
-            self.head_size,
-            self.block_size,
-        )
+        if self.layout == "flash":
+            return (
+                self.block_size,
+                self.num_heads,
+                self.head_size,
+            )
+        else:
+            return (
+                self.num_heads,
+                self.head_size,
+                self.block_size,
+            )
 
     def allocate_gpu_cache(self) -> List[KVCache]:
         gpu_cache: List[KVCache] = []

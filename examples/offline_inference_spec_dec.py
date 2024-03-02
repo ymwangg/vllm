@@ -7,13 +7,15 @@ prompts = [
     "The president of the United States is",
     "The capital of France is",
     "The future of AI is",
+    "Write a Python function to tell me what the date is today."
 ]
 # Create a sampling params object.
-sampling_params = SamplingParams(temperature=0.0, max_tokens=512)
+sampling_params = SamplingParams(temperature=0.2, top_p=0.95, max_tokens=512, logprobs=5, prompt_logprobs=2)
 
 # Create an LLM.
-llm = LLM(model="lmsys/vicuna-13b-v1.5",
+llm = LLM(model="/home/ubuntu/models/Llama-2-7b-chat-hf/",
           draft_model="TinyLlama/TinyLlama-1.1B-Chat-v0.6",
+          enforce_eager=True,
           speculate_length=5)
 
 # Generate texts from the prompts. The output is a list of RequestOutput objects
