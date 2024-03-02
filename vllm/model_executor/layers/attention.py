@@ -15,6 +15,7 @@ from vllm.model_executor.input_metadata import InputMetadata
 from vllm.model_executor.layers.triton_kernel.prefix_prefill import (
     context_attention_fwd)
 from vllm.utils import is_hip
+from flash_attn import flash_attn_with_kvcache
 
 _SUPPORTED_HEAD_SIZES = [64, 80, 96, 112, 128, 256]
 # Should be the same as PARTITION_SIZE in `paged_attention_v2_launcher`.
@@ -128,7 +129,12 @@ class PagedAttention(nn.Module):
         # vectors will not be cached. This happens during the initial memory
         # profiling run.
         if key_cache is not None and value_cache is not None:
-            cache_ops.reshape_and_cache(
+            # For flash-attention layout, len(key_cache.shape) == 4
+            # For vllm layout, len(key_cache.shape) == 5
+            reshape_and_cache_method = cache_ops.reshape_and_cache if len(
+                key_cache.shape
+            ) == 5 else cache_ops.reshape_and_cache_flash_layout
+            reshape_and_cache_method(
                 key,
                 value,
                 key_cache,
@@ -139,8 +145,11 @@ class PagedAttention(nn.Module):
 
         if input_metadata.is_prompt:
             # normal attention
-            if (key_cache is None or value_cache is None
-                    or input_metadata.block_tables.numel() == 0):
+            # We always use xformers for prompt evaluation in the case of speculative decoding.
+            # This is because the target model's KV cache layout is not compatible with context_attention_fwd.
+            if input_metadata.use_speculate or (key_cache is None or value_cache is None
+                                      or input_metadata.block_tables.numel()
+                                      == 0):
                 if self.num_kv_heads != self.num_heads:
                     # As of Nov 2023, xformers only supports MHA. For MQA/GQA,
                     # project the key and value tensors to the desired number of
@@ -224,12 +233,21 @@ class PagedAttention(nn.Module):
                     input_metadata.max_seq_len,
                     getattr(self, "alibi_slopes", None),
                 )
-
+        elif input_metadata.is_multi_query_mode:
+            # Run multi-query attention.
+            output = flash_attn_with_kvcache(
+                query.view(batch_size, seq_len, self.num_heads,
+                           self.head_size),
+                key_cache,
+                value_cache,
+                cache_seqlens=input_metadata.context_lens,
+                block_table=input_metadata.block_tables,
+                causal=True,
+                alibi_slopes=self.alibi_slopes,
+            )
         else:
             # Decoding run.
-            attn_kernel = _paged_multi_query_attention if \
-                input_metadata.is_multi_query_mode else _paged_attention
-            output = attn_kernel(
+            output = _paged_attention(
                 query,
                 key_cache,
                 value_cache,
