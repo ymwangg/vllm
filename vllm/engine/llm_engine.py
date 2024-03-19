@@ -799,6 +799,18 @@ class LLMEngine:
         seq = seqs[0]
         for token_id, logprobs in zip(outputs.output_tokens, outputs.logprobs):
             seq.append_token_id(token_id, logprobs)
+            # Check if the sequence has reched stop or eos tokens.
+            if token_id in seq_group.sampling_params.stop_token_ids:
+                break
+            if ((not seq_group.sampling_params.ignore_eos)
+                    and token_id == self.get_tokenizer_for_seq(seq).eos_token_id):
+                break
+            # Check if the sequence has reached max_model_len.
+            if seq.get_len() > self.scheduler_config.max_model_len:
+                break
+            # Check if the sequence has reached max_tokens.
+            if seq.get_output_len() == seq_group.sampling_params.max_tokens:
+                break
         seq.update_acceptance_history(outputs.num_accepted_tokens)
         self._decode_sequence(seq, seq_group.sampling_params)
         self._check_stop(seq, seq_group.sampling_params)
@@ -1033,16 +1045,6 @@ class LLMEngine:
                     seq.status = SequenceStatus.FINISHED_STOPPED
                     return
 
-        offset = self.speculate_length + 1 if self.use_speculate else 1
-        for token in seq.data.output_token_ids[-offset:]:
-            if token in sampling_params.stop_token_ids:
-                seq.status = SequenceStatus.FINISHED_STOPPED
-                return
-            if ((not sampling_params.ignore_eos)
-                    and token == self.get_tokenizer_for_seq(seq).eos_token_id):
-                seq.status = SequenceStatus.FINISHED_STOPPED
-                return
-
         if seq.get_last_token_id() in sampling_params.stop_token_ids:
             stop_str = self.get_tokenizer_for_seq(seq).convert_ids_to_tokens(
                 seq.get_last_token_id())
@@ -1056,8 +1058,7 @@ class LLMEngine:
             return
 
         # Check if the sequence has reached max_tokens.
-        if sampling_params.max_tokens and seq.get_output_len(
-        ) >= sampling_params.max_tokens:
+        if seq.get_output_len() == sampling_params.max_tokens:
             seq.status = SequenceStatus.FINISHED_LENGTH_CAPPED
             return
 
