@@ -354,11 +354,12 @@ class EngineArgs:
                                              is_draft_model=True)
             max_model_len = min(model_config.max_model_len,
                                 draft_model_config.max_model_len)
-            if draft_model_config.max_model_len < model_config.max_model_len:
-                ctx_len, d_ctx_len = model_config.max_model_len, draft_model_config.max_model_len
+            ctx_len, d_ctx_len = model_config.max_model_len, draft_model_config.max_model_len
+            max_model_len = min(ctx_len, d_ctx_len)
+            if d_ctx_len < ctx_len:
                 logger.warning(
                     f"The draft model's max context length ({d_ctx_len}) is smaller than the target model ({ctx_len}), "
-                    f"the max context length is now set to {ctx_len}.")
+                    f"the max context length is now set to {d_ctx_len}.")
 
         cache_config = CacheConfig(self.block_size,
                                    self.gpu_memory_utilization,
