@@ -147,9 +147,9 @@ class PagedAttention(nn.Module):
             # normal attention
             # We always use xformers for prompt evaluation in the case of speculative decoding.
             # This is because the target model's KV cache layout is not compatible with context_attention_fwd.
-            if input_metadata.use_speculate or (key_cache is None or value_cache is None
-                                      or input_metadata.block_tables.numel()
-                                      == 0):
+            if input_metadata.use_speculate or (
+                    key_cache is None or value_cache is None
+                    or input_metadata.block_tables.numel() == 0):
                 if self.num_kv_heads != self.num_heads:
                     # As of Nov 2023, xformers only supports MHA. For MQA/GQA,
                     # project the key and value tensors to the desired number of

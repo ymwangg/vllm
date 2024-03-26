@@ -802,8 +802,8 @@ class LLMEngine:
             # Check if the sequence has reched stop or eos tokens.
             if token_id in seq_group.sampling_params.stop_token_ids:
                 break
-            if ((not seq_group.sampling_params.ignore_eos)
-                    and token_id == self.get_tokenizer_for_seq(seq).eos_token_id):
+            if ((not seq_group.sampling_params.ignore_eos) and token_id
+                    == self.get_tokenizer_for_seq(seq).eos_token_id):
                 break
             # Check if the sequence has reached max_model_len.
             if seq.get_len() > self.scheduler_config.max_model_len:
