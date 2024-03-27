@@ -108,7 +108,7 @@ class Scheduler:
                 block_size=self.cache_config.block_size,
                 num_gpu_blocks=self.cache_config.num_gpu_blocks,
                 num_cpu_blocks=self.cache_config.num_cpu_blocks,
-                sliding_window=self.cache_config.sliding_window)
+                sliding_window=self.cache_config.d_sliding_window)
 
         # Create the prefix pool to cache the prefixes.
         self.prefix_pool = PrefixPool(self.cache_config.block_size)
@@ -439,8 +439,8 @@ class Scheduler:
         self.block_manager.free(seq)
         if self.use_speculate:
             self.d_block_manager.free(seq)
-            assert self.block_manager.get_num_free_gpu_blocks() == \
-                self.d_block_manager.get_num_free_gpu_blocks()
+            # assert self.block_manager.get_num_free_gpu_blocks() == \
+            #     self.d_block_manager.get_num_free_gpu_blocks()
 
     def free_finished_seq_groups(self) -> None:
         self.running = deque(seq_group for seq_group in self.running

@@ -61,6 +61,8 @@ class ModelRunner:
         # FIXME(woosuk): This is a hack to make the tests work. Refactor this.
         self.sliding_window = (model_config.get_sliding_window()
                                if model_config is not None else None)
+        self.d_sliding_window = (draft_model_config.get_sliding_window()
+                               if draft_model_config is not None else None)
         self.device_config = (device_config
                               if device_config is not None else DeviceConfig())
         self.device = self.device_config.device
@@ -214,11 +216,12 @@ class ModelRunner:
             # block size is 4, the first two tokens are masked and the slot
             # mapping will be [-1, -1, 2, 3, 4, 5, 6, 7, 0, 1].
             start_idx = 0
-            if self.sliding_window is not None:
+            sliding_window = self.d_sliding_window if is_draft_model else self.sliding_window
+            if sliding_window is not None:
                 assert prefix_len == 0, (
                     "Prefix caching is currently not supported with "
                     "sliding window attention")
-                start_idx = max(0, prompt_len - self.sliding_window)
+                start_idx = max(0, prompt_len - sliding_window)
             for i in range(prefix_len, prompt_len):
                 if i < start_idx:
                     slot_mapping[-1].append(_PAD_SLOT_ID)
@@ -302,6 +305,7 @@ class ModelRunner:
         lora_index_mapping: List[int] = []
         lora_prompt_mapping: List[int] = []
         lora_requests: Set[LoRARequest] = set()
+        sliding_window = self.d_sliding_window if is_draft_model else self.sliding_window
 
         for seq_group_metadata in seq_group_metadata_list:
             assert not seq_group_metadata.is_prompt
@@ -330,8 +334,8 @@ class ModelRunner:
                 input_tokens.append(generation_tokens)
                 seq_len = seq_data.get_len() + seq_data.get_num_draft_tokens()
 
-                context_len = seq_len if self.sliding_window is None else min(
-                    seq_len, self.sliding_window)
+                context_len = seq_len if sliding_window is None else min(
+                    seq_len, sliding_window)
                 context_lens.append(context_len)
 
                 first_position = seq_len - num_generation_tokens
@@ -355,8 +359,8 @@ class ModelRunner:
                 lora_index_mapping.append([lora_id])
                 lora_prompt_mapping.append(lora_id)
 
-                if self.sliding_window is not None:
-                    sliding_window_blocks = (self.sliding_window //
+                if sliding_window is not None:
+                    sliding_window_blocks = (sliding_window //
                                              self.block_size)
                     block_table = block_table[-sliding_window_blocks:]
                 block_tables.append(block_table)
