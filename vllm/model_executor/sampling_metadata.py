@@ -87,6 +87,7 @@ class SamplingMetadata:
             and the second tuple is [0, 1] (sampled index within pruned logit).
         num_prompts: Number of prompt sequence groups in seq_groups.
     """
+
     def __init__(
         self,
         seq_groups: List[SequenceGroupToSample],

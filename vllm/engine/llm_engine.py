@@ -26,8 +26,7 @@ from vllm.sequence import (ExecuteModelRequest, MultiModalData, SamplerOutput,
                            Sequence, SequenceGroup, SequenceGroupMetadata,
                            SequenceStatus, SpeculateOutput,
                            SpeculateSequenceGroupOutput)
-from vllm.transformers_utils.detokenizer import Detokenizer
-from vllm.transformers_utils.tokenizer import speculate_detokenize_incrementally
+from vllm.transformers_utils.detokenizer import Detokenizer, speculate_detokenize_incrementally
 from vllm.transformers_utils.tokenizer_group import (BaseTokenizerGroup,
                                                      get_tokenizer_group)
 from vllm.usage.usage_lib import (UsageContext, is_usage_stats_enabled,
@@ -82,6 +81,7 @@ class LLMEngine:
         log_stats: Whether to log statistics.
         usage_context: Specified entry point, used for usage info collection
     """
+
     def __init__(
         self,
         model_config: ModelConfig,
@@ -97,7 +97,6 @@ class LLMEngine:
         executor_class: Type[ExecutorBase],
         log_stats: bool,
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
-        speculate_config: Optional[SpeculateConfig] = None,
     ) -> None:
         logger.info(
             "Initializing an LLM engine (v%s) with config: "
@@ -136,11 +135,6 @@ class LLMEngine:
         # TODO(woosuk): Print more configs in debug mode.
 
         self.model_config = model_config
-
-        # speculative decoding related params
-        self.speculate_config = speculate_config
-        self.use_speculate = speculate_config is not None
-
         self.cache_config = cache_config
         self.lora_config = lora_config
         self.vision_language_config = vision_language_config
@@ -148,6 +142,7 @@ class LLMEngine:
         self.scheduler_config = scheduler_config
         self.device_config = device_config
         self.speculative_config = speculative_config
+        self.use_speculate = speculative_config is not None
         self.load_config = load_config
         self.decoding_config = decoding_config or DecodingConfig()
         self.log_stats = log_stats
@@ -221,10 +216,7 @@ class LLMEngine:
         # Create the scheduler.
         # NOTE: the cache_config here have been updated with the numbers of
         # GPU and CPU blocks, which are profiled in the distributed executor.
-        self.scheduler = Scheduler(scheduler_config,
-                                   cache_config,
-                                   lora_config,
-                                   speculate_config=speculate_config)
+        self.scheduler = Scheduler(scheduler_config, cache_config, lora_config)
 
         # Metric Logging.
         if self.log_stats:
@@ -304,7 +296,6 @@ class LLMEngine:
             executor_class=executor_class,
             log_stats=not engine_args.disable_log_stats,
             usage_context=usage_context,
-            speculate_config=engine_config.speculate_config,
         )
         return engine
 
@@ -541,6 +532,163 @@ class LLMEngine:
             request_outputs.append(request_output)
         return request_outputs
 
+    def _process_model_outputs_old(
+            self, output: Union[SamplerOutput, SpeculateOutput],
+            scheduler_outputs: SchedulerOutputs) -> List[RequestOutput]:
+        now = time.time()
+        # Update the scheduled sequence groups with the model outputs.
+        scheduled_seq_groups = scheduler_outputs.scheduled_seq_groups
+
+        for scheduled_seq_group, outputs in zip(scheduled_seq_groups, output):
+            seq_group = scheduled_seq_group.seq_group
+            token_chunk_size = scheduled_seq_group.token_chunk_size
+            seq_group.update_num_computed_tokens(token_chunk_size)
+            self._process_speculate_sequence_group_outputs(seq_group, outputs)
+
+        # Free the finished sequence groups.
+        self.scheduler.free_finished_seq_groups()
+
+        # Create the outputs.
+        request_outputs: List[RequestOutput] = []
+        for scheduled_seq_group in scheduled_seq_groups:
+            seq_group = scheduled_seq_group.seq_group
+            seq_group.maybe_set_first_token_time(now)
+            request_output = RequestOutput.from_seq_group(seq_group)
+            request_outputs.append(request_output)
+        for seq_group in scheduler_outputs.ignored_seq_groups:
+            request_output = RequestOutput.from_seq_group(seq_group)
+            request_outputs.append(request_output)
+
+        # Log stats.
+        if self.log_stats:
+            self.stat_logger.log(self._get_stats(scheduler_outputs))
+        return request_outputs
+
+    def _speculate_decode_sequence(self, seq: Sequence,
+                                   prms: SamplingParams) -> None:
+        """Decodes the new token for a sequence."""
+        # TODO(@yanmwang): Update this function to use self.detokenizer
+        (new_tokens, new_output_text, prefix_offset,
+         read_offset) = speculate_detokenize_incrementally(
+             self.get_tokenizer_for_seq(seq),
+             all_input_ids=seq.get_token_ids(),
+             prev_tokens=seq.tokens,
+             prefix_offset=seq.prefix_offset,
+             read_offset=seq.read_offset,
+             new_token_start_loc=seq.new_token_start_loc,
+             skip_special_tokens=prms.skip_special_tokens,
+             spaces_between_special_tokens=prms.spaces_between_special_tokens,
+         )
+        if seq.tokens is None:
+            seq.tokens = new_tokens
+        else:
+            seq.tokens.extend(new_tokens)
+        seq.prefix_offset = prefix_offset
+        seq.read_offset = read_offset
+        seq.output_text += new_output_text
+        seq.new_output_text = new_output_text
+        # Update seq.new_token_start_loc to support decoding multiple tokens in one step.
+        seq.mark_decode_step()
+
+    def _process_speculate_sequence_group_outputs(
+            self, seq_group: SequenceGroup,
+            outputs: SpeculateSequenceGroupOutput) -> None:
+        # Process prompt logprobs
+        prompt_logprobs = outputs.prompt_logprobs
+        if prompt_logprobs is not None:
+            seq_group.prompt_logprobs = prompt_logprobs
+        # Process samples
+        seqs = seq_group.get_seqs(status=SequenceStatus.RUNNING)
+        assert len(
+            seqs
+        ) == 1, "Only one seq is allowed per seq group when using speculative decoding."
+        seq = seqs[0]
+        for token_id, logprobs in zip(outputs.output_tokens, outputs.logprobs):
+            seq.append_token_id(token_id, logprobs)
+            # Check if the sequence has reched stop or eos tokens.
+            if token_id in seq_group.sampling_params.stop_token_ids:
+                break
+            if ((not seq_group.sampling_params.ignore_eos) and token_id
+                    == self.get_tokenizer_for_seq(seq).eos_token_id):
+                break
+            # Check if the sequence has reached max_model_len.
+            if seq.get_len() > self.scheduler_config.max_model_len:
+                break
+            # Check if the sequence has reached max_tokens.
+            if seq.get_output_len() == seq_group.sampling_params.max_tokens:
+                break
+        seq.update_acceptance_history(outputs.num_accepted_tokens)
+        self._speculate_decode_sequence(seq, seq_group.sampling_params)
+        self._check_stop(seq, seq_group.sampling_params)
+        if seq.is_finished():
+            self.scheduler.free_seq(seq)
+        return
+
+    def _check_stop(self, seq: Sequence,
+                    sampling_params: SamplingParams) -> None:
+        """Stop the finished sequences."""
+        # Check if the sequence has reached max_model_len.
+        if seq.get_len() > self.scheduler_config.max_model_len:
+            seq.status = SequenceStatus.FINISHED_LENGTH_CAPPED
+            return
+
+        # Check if the sequence has reached max_tokens.
+        if seq.get_output_len() == sampling_params.max_tokens:
+            seq.status = SequenceStatus.FINISHED_LENGTH_CAPPED
+            return
+
+        # Check if the minimum number of tokens has been generated yet;
+        # skip the stop string/token checks if not
+        if seq.get_output_len() < sampling_params.min_tokens:
+            return
+
+        for stop_str in sampling_params.stop:
+            if self.use_speculate:
+                # Speculate decoding may generate multiple tokens
+                num_new_chars = len(seq.new_output_text)
+                num_chars = len(seq.output_text)
+                num_stop_chars = len(stop_str)
+                offset = max(0,
+                             num_chars - (num_new_chars + num_stop_chars - 1))
+                if (loc := seq.output_text[offset:].find(stop_str)) != -1:
+                    seq.output_text = seq.output_text[:offset + loc +
+                                                      num_stop_chars]
+                    self._finalize_sequence(seq, sampling_params, stop_str)
+                    seq.status = SequenceStatus.FINISHED_STOPPED
+                    seq.stop_reason = stop_str
+                    return
+            else:
+                if seq.output_text.endswith(stop_str):
+                    self._finalize_sequence(seq, sampling_params, stop_str)
+                    seq.status = SequenceStatus.FINISHED_STOPPED
+                    seq.stop_reason = stop_str
+                    return
+        last_token_id = seq.get_last_token_id()
+        if last_token_id in sampling_params.stop_token_ids:
+            stop_str = self.get_tokenizer_for_seq(seq).convert_ids_to_tokens(
+                last_token_id)
+            self._finalize_sequence(seq, sampling_params, stop_str)
+            seq.status = SequenceStatus.FINISHED_STOPPED
+            seq.stop_reason = last_token_id
+            return
+
+        # Check if the sequence has generated the EOS token.
+        if ((not sampling_params.ignore_eos)
+                and seq.get_last_token_id() == seq.eos_token_id):
+            seq.status = SequenceStatus.FINISHED_STOPPED
+            return
+
+    def _finalize_sequence(self, seq: Sequence,
+                           sampling_params: SamplingParams,
+                           stop_string: str) -> None:
+        if sampling_params.include_stop_str_in_output:
+            return
+
+        if stop_string and seq.output_text.endswith(stop_string):
+            # Truncate the output text so that the stop string is
+            # not included in the output.
+            seq.output_text = seq.output_text[:-len(stop_string)]
+
     def step(self) -> List[RequestOutput]:
         """Performs one decoding iteration and returns newly generated results.
 
@@ -602,15 +750,19 @@ class LLMEngine:
                 blocks_to_copy=scheduler_outputs.blocks_to_copy,
                 num_lookahead_slots=scheduler_outputs.num_lookahead_slots,
                 running_queue_size=scheduler_outputs.running_queue_size,
+                use_speculate=self.use_speculate,
             )
             output = self.model_executor.execute_model(
                 execute_model_req=execute_model_req)
         else:
             output = []
-
-        request_outputs = self._process_model_outputs(
-            output, scheduler_outputs.scheduled_seq_groups,
-            scheduler_outputs.ignored_seq_groups, seq_group_metadata_list)
+        if self.use_speculate:
+            request_outputs = self._process_model_outputs_old(
+                output[0], scheduler_outputs)
+        else:
+            request_outputs = self._process_model_outputs(
+                output, scheduler_outputs.scheduled_seq_groups,
+                scheduler_outputs.ignored_seq_groups, seq_group_metadata_list)
 
         # Log stats.
         self.do_log_stats(scheduler_outputs, output)

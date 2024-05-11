@@ -18,15 +18,15 @@ logger = init_logger(__name__)
 _TP_DEVICE_GROUP = None
 _TP_CPU_GROUP = None
 
+
 class ActiveModel(enum.Enum):
     TARGET = enum.auto()
     DRAFT = enum.auto()
 
 
-# Tensor model parallel group that the current rank belongs to.
-_TENSOR_MODEL_PARALLEL_GROUP = None
-# Draft model tensor parallel group for speculative decoding
-_DRAFT_MODEL_TP_GROUP = None
+# Draft model tensor parallel size for speculative decoding
+_DRAFT_MODEL_TP_SIZE = None
+
 # Pipeline model parallel group that the current rank belongs to.
 _PIPELINE_MODEL_PARALLEL_GROUP = None
 
@@ -95,6 +95,8 @@ def init_distributed_environment(
             local_rank = envs.LOCAL_RANK
         global _LOCAL_RANK
         _LOCAL_RANK = local_rank
+
+
 _ACTIVE_MODEL: ActiveModel = ActiveModel.TARGET
 
 
@@ -130,8 +132,6 @@ def initialize_model_parallel(
             parallelism.
         pipeline_model_parallel_size: number of GPUs used for pipeline model
             parallelism.
-        draft_model_tp_size: number of GPUs used for draft model's tensor
-            model parallelism.
 
     Let's say we have a total of 8 GPUs denoted by g0 ... g7 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -190,18 +190,9 @@ def initialize_model_parallel(
             _PIPELINE_MODEL_PARALLEL_GROUP = group
             _PIPELINE_GLOBAL_RANKS = ranks
 
-    # Build the tensor parallel groups for draft model
-    global _DRAFT_MODEL_TP_GROUP
-    if draft_model_tp_size:
-        assert _DRAFT_MODEL_TP_GROUP is None, (
-            "draft model tensor parallel group is already initialized")
-        # place draft model on the first n devices
-        num_draft_model_group = tensor_model_parallel_size//draft_model_tp_size
-        for i in range(num_draft_model_group):
-            ranks = range(i, world_size, num_draft_model_group)
-            group = torch.distributed.new_group(ranks)
-            if rank in ranks:
-               _DRAFT_MODEL_TP_GROUP = group
+    global _DRAFT_MODEL_TP_SIZE
+    assert _DRAFT_MODEL_TP_SIZE is None, ("draft model tp size is already set")
+    _DRAFT_MODEL_TP_SIZE = draft_model_tp_size
 
 
 def ensure_model_parallel_initialized(
@@ -218,8 +209,7 @@ def ensure_model_parallel_initialized(
     backend = backend or torch.distributed.get_backend()
     if not model_parallel_is_initialized():
         initialize_model_parallel(tensor_model_parallel_size,
-                                  pipeline_model_parallel_size,
-                                  backend
+                                  pipeline_model_parallel_size, backend,
                                   draft_model_tp_size)
         return
 
@@ -270,6 +260,8 @@ def get_pipeline_model_parallel_group():
 
 def get_tensor_model_parallel_world_size():
     """Return world size for the tensor model parallel group."""
+    if _ACTIVE_MODEL == ActiveModel.DRAFT:
+        return _DRAFT_MODEL_TP_SIZE
     return torch.distributed.get_world_size(
         group=get_tensor_model_parallel_group())
 
@@ -282,6 +274,8 @@ def get_pipeline_model_parallel_world_size():
 
 def get_tensor_model_parallel_rank():
     """Return my rank for the tensor model parallel group."""
+    if _ACTIVE_MODEL == ActiveModel.DRAFT and _DRAFT_MODEL_TP_SIZE == 1:
+        return 0
     return torch.distributed.get_rank(group=get_tensor_model_parallel_group())
 
 

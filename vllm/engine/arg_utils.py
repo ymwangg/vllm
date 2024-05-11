@@ -9,9 +9,6 @@ from vllm.config import (CacheConfig, DecodingConfig, DeviceConfig,
                          TokenizerPoolConfig, VisionLanguageConfig)
 from vllm.model_executor.layers.quantization import QUANTIZATION_METHODS
 from vllm.utils import str_to_int_tuple
-from vllm.logger import init_logger
-
-logger = init_logger(__name__)
 
 
 def nullable_str(val: str):
@@ -84,6 +81,7 @@ class EngineArgs:
     guided_decoding_backend: str = 'outlines'
     # Speculative decoding configuration.
     speculative_model: Optional[str] = None
+    draft_model_tp_size: Optional[int] = 1
     num_speculative_tokens: Optional[int] = None
     speculative_max_model_len: Optional[int] = None
     ngram_prompt_lookup_max: Optional[int] = None
@@ -456,6 +454,14 @@ class EngineArgs:
             'The name of the draft model to be used in speculative decoding.')
 
         parser.add_argument(
+            '--draft-model-tp-size',
+            type=int,
+            default=EngineArgs.draft_model_tp_size,
+            help=
+            'The tensor parallel size of the draft model to be used in speculative decoding.'
+        )
+
+        parser.add_argument(
             '--num-speculative-tokens',
             type=int,
             default=EngineArgs.num_speculative_tokens,
@@ -544,7 +550,9 @@ class EngineArgs:
                 self.tokenizer_pool_size,
                 self.tokenizer_pool_type,
                 self.tokenizer_pool_extra_config,
-            ), self.ray_workers_use_nsight)
+            ),
+            self.ray_workers_use_nsight,
+            draft_model_tp_size=self.draft_model_tp_size)
 
         speculative_config = SpeculativeConfig.maybe_create_spec_config(
             target_model_config=model_config,
@@ -562,7 +570,7 @@ class EngineArgs:
         scheduler_config = SchedulerConfig(
             self.max_num_batched_tokens,
             self.max_num_seqs,
-            max_model_len,
+            model_config.max_model_len,
             self.use_v2_block_manager,
             num_lookahead_slots=(self.num_lookahead_slots
                                  if speculative_config is None else

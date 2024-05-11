@@ -76,6 +76,7 @@ class ModelConfig:
             names provided, the first name will be used. If not specified, 
             the model name will be the same as `model`.
     """
+
     def __init__(
         self,
         model: str,
@@ -333,6 +334,7 @@ class CacheConfig:
         num_gpu_blocks_override: Number of GPU blocks to use. This overrides the
             profiled num_gpu_blocks if specified. Does nothing if None.
     """
+
     def __init__(
         self,
         block_size: int,
@@ -538,6 +540,7 @@ class ParallelConfig:
         ray_workers_use_nsight: Whether to profile Ray workers with nsight, see
             https://docs.ray.io/en/latest/ray-observability/user-guides/profiling.html#profiling-nsight-profiler.
     """
+
     def __init__(
         self,
         pipeline_parallel_size: int,
@@ -559,6 +562,9 @@ class ParallelConfig:
         self.ray_workers_use_nsight = ray_workers_use_nsight
         self.placement_group = placement_group
         self.draft_model_tp_size = draft_model_tp_size
+        assert draft_model_tp_size in (
+            1, tensor_parallel_size
+        ), "Draft model tp size must be 1 or the same as target model"
 
         self.world_size = pipeline_parallel_size * self.tensor_parallel_size
         if self.world_size > 1:
@@ -605,6 +611,7 @@ class SchedulerConfig:
         enable_chunked_prefill: If True, prefill requests can be chunked based
             on the remaining max_num_batched_tokens.
     """
+
     def __init__(
         self,
         max_num_batched_tokens: Optional[int],
@@ -663,6 +670,7 @@ class SchedulerConfig:
 
 
 class DeviceConfig:
+
     def __init__(self, device: str = "auto") -> None:
         if device == "auto":
             # Automated device type detection
@@ -692,6 +700,7 @@ class SpeculativeConfig:
     The configuration is currently specialized to draft-model speculative
     decoding with top-1 proposals.
     """
+
     @staticmethod
     def maybe_create_spec_config(
         target_model_config: ModelConfig,
@@ -800,6 +809,7 @@ class SpeculativeConfig:
                 max_seq_len_to_capture=target_model_config.
                 max_seq_len_to_capture,
                 max_logprobs=target_model_config.max_logprobs,
+                is_draft_model=True,
             )
 
             draft_model_config.max_model_len = (
@@ -989,6 +999,7 @@ class LoRAConfig:
 class VisionLanguageConfig:
     """Configs the input data format and how models should run for
     vision language models."""
+
     class ImageInputType(enum.Enum):
         """Image input type into the vision language model.
 
@@ -1223,9 +1234,3 @@ class EngineConfig:
         """
         return dict(
             (field.name, getattr(self, field.name)) for field in fields(self))
-
-
-@dataclass
-class SpeculateConfig:
-    draft_model_config: ModelConfig
-    speculate_length: int

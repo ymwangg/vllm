@@ -49,7 +49,7 @@ class LogitsProcessor(nn.Module):
             # hidden_states is of shape [bsz * num_query_tokens, vocab_size]
             if not sampling_metadata.is_multi_query_mode:
                 hidden_states = _prune_hidden_states(hidden_states,
-                                                    sampling_metadata)
+                                                     sampling_metadata)
 
             # Get the logits for the next tokens.
             logits = self._get_logits(hidden_states, embedding, embedding_bias)

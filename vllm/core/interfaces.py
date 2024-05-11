@@ -37,9 +37,7 @@ class BlockSpaceManager(ABC):
         raise ValueError(f"Unknown version {version=}")
 
     @abstractmethod
-    def can_allocate(self,
-                     seq_group: SequenceGroup,
-                     num_padding_tokens: int = 0) -> AllocStatus:
+    def can_allocate(self, seq_group: SequenceGroup) -> AllocStatus:
         pass
 
     @abstractmethod
@@ -57,19 +55,6 @@ class BlockSpaceManager(ABC):
         seq: Sequence,
         num_lookahead_slots: int,
     ) -> Dict[int, List[int]]:
-        pass
-
-    @abstractmethod
-    def can_append_multiple_slots(self,
-                                  seq_group: SequenceGroup,
-                                  num_new_tokens: int = 1) -> bool:
-        pass
-
-    @abstractmethod
-    def append_multiple_slots(
-            self,
-            seq: Sequence,
-            num_new_tokens: int = 1) -> Optional[Tuple[int, int]]:
         pass
 
     @abstractmethod

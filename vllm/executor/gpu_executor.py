@@ -19,10 +19,9 @@ class GPUExecutor(ExecutorBase):
         If speculative decoding is enabled, we instead create the speculative
         worker.
         """
-        if self.speculative_config is None:
-            self._init_non_spec_worker()
-        else:
-            self._init_spec_worker()
+        # Hack, we still do speculative decoding in non_spec_worker when passing
+        # speculative_config.
+        self._init_non_spec_worker()
 
     def _get_worker_kwargs(
             self,
@@ -46,6 +45,7 @@ class GPUExecutor(ExecutorBase):
             lora_config=self.lora_config,
             vision_language_config=self.vision_language_config,
             is_driver_worker=rank == 0,
+            speculative_config=self.speculative_config,
         )
 
     def _create_worker(self,

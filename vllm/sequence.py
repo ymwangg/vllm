@@ -188,7 +188,7 @@ class SequenceData:
         return (f"SequenceData("
                 f"prompt_token_ids={self.prompt_token_ids}, "
                 f"output_token_ids={self.output_token_ids}, "
-                f"cumulative_logprob={self.cumulative_logprob}")
+                f"cumulative_logprob={self.cumulative_logprob})")
 
 
 class Sequence:
@@ -799,6 +799,8 @@ class ExecuteModelRequest:
     num_lookahead_slots: int = 0
     # The number of requests in the running queue.
     running_queue_size: int = 0
+    # Whether using speculative decoding
+    use_speculate: bool = False
 
     def clone(
         self, seq_group_metadata_list: List[SequenceGroupMetadata]
@@ -812,6 +814,7 @@ class ExecuteModelRequest:
             num_lookahead_slots=self.num_lookahead_slots,
             running_queue_size=self.running_queue_size,
         )
+
 
 class SpeculateSequenceGroupOutput:
     """The model output associated with a sequence.

@@ -12,7 +12,7 @@ from vllm.attention import (AttentionMetadata, AttentionMetadataPerStage,
 from vllm.attention.backends.flashinfer import FlashInferBackend
 from vllm.config import (DeviceConfig, LoadConfig, LoRAConfig, ModelConfig,
                          ParallelConfig, SchedulerConfig, VisionLanguageConfig,
-                         SpeculateConfig)
+                         SpeculativeConfig)
 from vllm.distributed import broadcast_tensor_dict, with_pynccl_for_all_reduce
 from vllm.distributed.device_communicators import (custom_all_reduce,
                                                    pynccl_utils)
@@ -28,7 +28,8 @@ from vllm.sequence import (MultiModalData, SamplerOutput, SequenceData,
                            SpeculateSequenceGroupOutput)
 from vllm.utils import (CudaMemoryProfiler, get_kv_cache_torch_dtype, is_hip,
                         is_pin_memory_available, make_tensor_with_pad)
-from vllm.model_executor.parallel_utils.communication_op import tensor_model_parallel_all_gather
+from vllm.distributed.communication_op import tensor_model_parallel_all_gather
+from vllm.distributed.parallel_state import MarkActiveModel, ActiveModel
 
 logger = init_logger(__name__)
 
@@ -103,6 +104,7 @@ class BatchType(IntEnum):
 
 
 class ModelRunner:
+
     def __init__(
         self,
         model_config: ModelConfig,
@@ -115,7 +117,7 @@ class ModelRunner:
         is_driver_worker: bool = False,
         vision_language_config: Optional[VisionLanguageConfig] = None,
         rank: int = 0,
-        speculate_config: Optional[SpeculateConfig] = None,
+        speculative_config: Optional[SpeculativeConfig] = None,
     ):
         self.model_config = model_config
         self.parallel_config = parallel_config
@@ -164,11 +166,11 @@ class ModelRunner:
         self.flashinfer_workspace_buffer: torch.Tensor
         # speculative decoding related variables
         self.rank = rank
-        self.draft_model: torch.nn.Module # set after load_model
-        if speculate_config:
+        self.draft_model: torch.nn.Module  # set after load_model
+        if speculative_config:
             self.use_speculate = True
-            self.draft_model_config = speculate_config.draft_model_config
-            self.speculate_length = speculate_config.speculate_length
+            self.draft_model_config = speculative_config.draft_model_config
+            self.speculate_length = speculative_config.num_speculative_tokens
         else:
             self.use_speculate = False
             self.draft_model_config = None
@@ -235,8 +237,15 @@ class ModelRunner:
                 # NOTE: We use global variable to control parallel state (world size, rank)
                 # of draft model used in speculative decoding.
                 with CudaMemoryProfiler() as m:
-                    self.draft_model = get_model(self.draft_model_config,
-                                                 self.device_config)
+                    self.draft_model = get_model(
+                        model_config=self.draft_model_config,
+                        device_config=self.device_config,
+                        load_config=self.load_config,
+                        lora_config=self.lora_config,
+                        vision_language_config=self.vision_language_config,
+                        parallel_config=self.parallel_config,
+                        scheduler_config=self.scheduler_config,
+                    )
                 self.draft_model_memory_usage = m.consumed_memory
                 logger.info(
                     f"Loading draft model weights took "
@@ -1124,29 +1133,32 @@ class ModelRunner:
                 # memory usage of CUDA graph.
                 for batch_size in reversed(batch_size_capture_list):
                     # Create dummy attn_metadata.
-                    attn_metadata = self.attn_backend.make_metadata(
+                    decode_metadata = self.attn_backend.make_metadata(
                         is_prompt=False,
+                        seq_lens=None,
+                        seq_lens_tensor=context_lens[:batch_size],
+                        max_query_len=None,
+                        max_seq_len=None,
+                        subquery_start_loc=None,
+                        seq_start_loc=None,
+                        context_lens_tensor=None,
+                        block_tables=block_tables[:batch_size],
+                        use_cuda_graph=True,
+                        real_batch_size=batch_size,
+                        seq_len=input_tokens.shape[1],
+                        is_multi_query_mode=is_multi_query_mode,
+                    )
+                    attn_metadata = AttentionMetadata(
+                        num_prefills=0,
+                        num_prefill_tokens=0,
+                        num_decode_tokens=batch_size,
                         # NOTE: slot_mapping is 2d, we need to flatten it to
                         # 1d after slicing.
                         slot_mapping=slot_mapping[:batch_size].view(-1),
-                        prompt_lens=None,
-                        prompt_lens_tensor=None,
-                        num_prompt_tokens=0,
-                        num_generation_tokens=batch_size,
-                        max_subquery_len=None,
-                        max_context_len=self.max_context_len_to_capture,
-                        max_prompt_len=None,
-                        subquery_start_loc=None,
-                        seq_start_loc=None,
-                        context_lens=context_lens[:batch_size],
-                        block_tables=block_tables[:batch_size],
-                        use_cuda_graph=True,
+                        prefill_metadata=None,
+                        decode_metadata=decode_metadata,
                         kv_cache_dtype=self.kv_cache_dtype,
-                        real_batch_size=batch_size,
-                        seq_len=seq_len,
-                        is_multi_query_mode=is_multi_query_mode,
                     )
-
                     graph_runner = CUDAGraphRunner(self.draft_model) if is_draft_model \
                         else CUDAGraphRunner(self.model)
                     with MarkActiveModel(active_model):
@@ -1180,8 +1192,8 @@ class ModelRunner:
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
         is_multi_query_mode: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor, AttentionMetadata, List[int],
-               List[int]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, AttentionMetadata,
+               SamplingMetadata]:
         assert len(seq_group_metadata_list) > 0
         input_tokens: List[List[int]] = []
         input_positions: List[List[int]] = []
@@ -1242,11 +1254,10 @@ class ModelRunner:
         batch_size = len(input_tokens)
         # record the real batch size for cudagraph in case of padding
         real_batch_size = batch_size
-        max_context_len = max(context_lens)
-        use_captured_graph = (
-            not self.model_config.enforce_eager
-            and batch_size <= _BATCH_SIZES_TO_CAPTURE[-1]
-            and max_context_len <= self.max_context_len_to_capture)
+        max_seq_len = max(context_lens)
+        use_captured_graph = (not self.model_config.enforce_eager
+                              and batch_size <= _BATCH_SIZES_TO_CAPTURE[-1]
+                              and max_seq_len <= self.max_seq_len_to_capture)
         if use_captured_graph:
             # Pad the input tokens, positions, and slot mapping to match the
             # batch size of the captured graph.
@@ -1305,38 +1316,26 @@ class ModelRunner:
                 device=self.device,
             )
 
-        attn_metadata = self.attn_backend.make_metadata(
+        decode_metadata = self.attn_backend.make_metadata(
             is_prompt=False,
-            slot_mapping=slot_mapping,
-            prompt_lens=None,
-            prompt_lens_tensor=None,
-            num_prompt_tokens=0,
-            num_generation_tokens=len(input_tokens),
-            max_subquery_len=None,
-            max_context_len=max_context_len,
-            max_prompt_len=None,
+            seq_lens=None,
+            seq_lens_tensor=context_lens,
+            max_query_len=None,
+            max_seq_len=None,
             subquery_start_loc=None,
             seq_start_loc=None,
-            context_lens=context_lens,
+            context_lens_tensor=None,
             block_tables=block_tables,
             use_cuda_graph=use_captured_graph,
-            kv_cache_dtype=self.kv_cache_dtype,
             real_batch_size=real_batch_size,
             seq_len=input_tokens.shape[1],
             is_multi_query_mode=is_multi_query_mode,
         )
-        sampling_metadata = SamplingMetadata(
-            seq_groups=seq_groups,
-            seq_data=seq_data_dict,
-            prompt_lens=None,
-            selected_token_indices=None,
-            categorized_sample_indices=None,
-            generators=None,
-            use_speculate=self.use_speculate,
-            is_multi_query_mode=is_multi_query_mode,
-            speculate_length=self.speculate_length,
-        )
-        return (input_tokens, input_positions, attn_metadata,
+        sampling_metadata = SamplingMetadata.prepare(seq_group_metadata_list,
+                                                     None, None, self.device,
+                                                     self.pin_memory)
+        sampling_metadata.speculate_length = self.speculate_length
+        return (input_tokens, input_positions, slot_mapping, decode_metadata,
                 sampling_metadata)
 
     def prepare_speculate_decode_input_tensors(
@@ -1344,31 +1343,41 @@ class ModelRunner:
         seq_group_metadata_list: List[SequenceGroupMetadata],
     ):
         if self.is_driver_worker:
-            input_tokens, input_positions, attn_metadata, sampling_metadata = self._prepare_speculate_decode(
-                seq_group_metadata_list)
+            (input_tokens, input_positions, slot_mapping, decode_metadata,
+             sampling_metadata
+             ) = self._prepare_speculate_decode(seq_group_metadata_list)
             # Broadcast the metadata.
             metadata_dict = {
                 "input_tokens": input_tokens,
                 "input_positions": input_positions,
+                "slot_mapping": slot_mapping,
             }
-            metadata_dict.update(attn_metadata.asdict_zerocopy())
+            metadata_dict.update(decode_metadata.asdict_zerocopy())
             broadcast_tensor_dict(metadata_dict, src=0)
         else:
             metadata_dict = broadcast_tensor_dict(src=0)
             input_tokens = metadata_dict.pop("input_tokens")
             input_positions = metadata_dict.pop("input_positions")
-            attn_metadata = self.attn_backend.make_metadata(**metadata_dict)
+            slot_mapping = metadata_dict.pop("slot_mapping")
+            decode_metadata = self.attn_backend.make_metadata(**metadata_dict)
             sampling_metadata = SamplingMetadata(
                 seq_groups=None,
-                seq_data=None,
-                prompt_lens=None,
                 selected_token_indices=None,
                 categorized_sample_indices=None,
+                num_prompts=0,
                 use_speculate=True,
                 is_multi_query_mode=False,
                 speculate_length=self.speculate_length,
-                perform_sampling=False,
             )
+        attn_metadata = AttentionMetadata(
+            num_prefills=0,
+            slot_mapping=slot_mapping,
+            num_prefill_tokens=0,
+            num_decode_tokens=input_tokens.shape[0],
+            prefill_metadata=None,
+            decode_metadata=decode_metadata,
+            kv_cache_dtype=self.kv_cache_dtype,
+        )
         return (input_tokens, input_positions, attn_metadata,
                 sampling_metadata)
 
@@ -1433,7 +1442,7 @@ class ModelRunner:
             logits = self.model.compute_logits(hidden_states,
                                                sampling_metadata)
             # Only perform sampling in the driver worker.
-            if not sampling_metadata.perform_sampling:
+            if not self.is_driver_worker:
                 return None
             # Sample the next token.
             output = self.model.sample(
@@ -1464,7 +1473,8 @@ class ModelRunner:
     ) -> SpeculateOutput:
         input_tokens, input_positions, attn_metadata, sampling_metadata = \
             self.prepare_speculate_decode_input_tensors(seq_group_metadata_list)
-        context_lens = attn_metadata.context_lens
+        decode_metadata = attn_metadata.decode_metadata
+        seq_lens_tensor = decode_metadata.seq_lens_tensor
         slot_mapping = attn_metadata.slot_mapping
         graph_batch_size = input_tokens.shape[0]
         # 1. Run the draft model
@@ -1472,10 +1482,10 @@ class ModelRunner:
             with MarkActiveModel(ActiveModel.DRAFT):
                 model = self.draft_model
                 model_executable = self.draft_model
-                attn_metadata.is_multi_query_mode = False
-                attn_metadata.seq_len = 1
-                attn_metadata.context_lens = context_lens - self.speculate_length + i
-                if attn_metadata.use_cuda_graph:
+                decode_metadata.is_multi_query_mode = False
+                decode_metadata.seq_len = 1
+                decode_metadata.seq_lens_tensor = seq_lens_tensor - self.speculate_length + i
+                if decode_metadata.use_cuda_graph:
                     model_executable = self.d_graph_runners[graph_batch_size]
                     # These tensors don't need to be contiguous when
                     # using cudagraph because CUDAGraphRunner will copy
@@ -1498,19 +1508,19 @@ class ModelRunner:
                 next_tokens = self.fast_greedy_sample(model, hidden_states)
                 input_tokens[:, i + 1] = next_tokens
         # 2. Run the target model
-        sampling_metadata.input_token_ids = input_tokens[:attn_metadata.
+        sampling_metadata.input_token_ids = input_tokens[:decode_metadata.
                                                          real_batch_size]
         sampling_metadata.is_multi_query_mode = True
         with MarkActiveModel(ActiveModel.TARGET):
             model = self.model
             model_executable = self.model
-            attn_metadata.is_multi_query_mode = True
-            attn_metadata.seq_len = self.speculate_length + 1
+            decode_metadata.is_multi_query_mode = True
+            decode_metadata.seq_len = self.speculate_length + 1
             input_tokens_1d = input_tokens.view(-1)
             input_positions_1d = input_positions.view(-1)
             attn_metadata.slot_mapping = slot_mapping.view(-1)
-            attn_metadata.context_lens = context_lens
-            if attn_metadata.use_cuda_graph:
+            decode_metadata.seq_lens_tensor = seq_lens_tensor
+            if decode_metadata.use_cuda_graph:
                 graph_runners = self.graph_runners
                 # For speculative decoding, cudagraph is only used in the evaluation stage
                 # for target model.
@@ -1525,12 +1535,12 @@ class ModelRunner:
             # Compute the logits.
             logits = model.compute_logits(hidden_states, sampling_metadata)
             # Only perform sampling in the driver worker.
-            if not sampling_metadata.perform_sampling:
+            if not self.is_driver_worker:
                 return None
             bs, num_tokens = input_tokens.shape
             # Convet logits from 1d to 2d, and slice it with real batch size.
             logits = logits.view(bs, num_tokens,
-                                 -1)[:attn_metadata.real_batch_size, ...]
+                                 -1)[:decode_metadata.real_batch_size, ...]
             # Sample the next token.
             output = self.model.sample(
                 logits=logits,
@@ -1582,7 +1592,8 @@ class ModelRunner:
         # TODO(youkaichao): when we get enough user feedback that pynccl is
         # more stable than cupy, we can remove this, e.g. in v0.4.1.
         self.graph_runners.clear()
-        self.d_graph_runners.clear()
+        if self.use_speculate:
+            self.d_graph_runners.clear()
         self.pynccl_backend = None
 
     @property
@@ -1591,6 +1602,7 @@ class ModelRunner:
 
 
 class CUDAGraphRunner:
+
     def __init__(self, model: nn.Module):
         self.model = model
         self.input_buffers: Dict[str, torch.Tensor] = {}

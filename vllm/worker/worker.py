@@ -8,7 +8,7 @@ import torch.distributed
 
 from vllm.config import (CacheConfig, DeviceConfig, LoadConfig, LoRAConfig,
                          ModelConfig, ParallelConfig, SchedulerConfig,
-                         VisionLanguageConfig, SpeculateConfig)
+                         VisionLanguageConfig, SpeculativeConfig)
 from vllm.distributed import (broadcast_tensor_dict,
                               ensure_model_parallel_initialized,
                               get_tensor_model_parallel_cpu_group,
@@ -46,7 +46,7 @@ class Worker(WorkerBase):
         lora_config: Optional[LoRAConfig] = None,
         vision_language_config: Optional[VisionLanguageConfig] = None,
         is_driver_worker: bool = False,
-        speculate_config: Optional[SpeculateConfig] = None,
+        speculative_config: Optional[SpeculativeConfig] = None,
     ) -> None:
         self.model_config = model_config
         self.parallel_config = parallel_config
@@ -70,12 +70,11 @@ class Worker(WorkerBase):
         if self.vision_language_config:
             assert not self.lora_config, (
                 "To be tested: vision language model with LoRA settings.")
-
         # speculative decoding related configs
-        if speculate_config:
+        if speculative_config:
             self.use_speculate = True
-            self.draft_model_config = speculate_config.draft_model_config
-            self.speculate_length = speculate_config.speculate_length
+            self.draft_model_config = speculative_config.draft_model_config
+            self.speculate_length = speculative_config.num_speculative_tokens
         else:
             self.use_speculate = False
             self.draft_model_config = None
@@ -92,7 +91,7 @@ class Worker(WorkerBase):
             is_driver_worker=is_driver_worker,
             vision_language_config=vision_language_config,
             rank=self.rank,
-            speculate_config=speculate_config,
+            speculative_config=speculative_config,
         )
         # Uninitialized cache engine. Will be initialized by
         # initialize_cache.
@@ -102,7 +101,6 @@ class Worker(WorkerBase):
         # Cache engine of draft model for speculative decoding.
         self.d_cache_engine = None
         self.d_gpu_cache = None
-
 
     def init_device(self) -> None:
         if self.device_config.device.type == "cuda":
@@ -248,8 +246,7 @@ class Worker(WorkerBase):
     @torch.inference_mode()
     def execute_model(
         self,
-        execute_model_req: Optional[ExecuteModelRequest] = None,
-         use_speculate: Optional[bool] = False,
+        execute_model_req: Optional[ExecuteModelRequest] = None
     ) -> List[SamplerOutput]:
 
         if execute_model_req is None:
@@ -261,6 +258,7 @@ class Worker(WorkerBase):
             assert seq_group_metadata_list is not None
             assert execute_model_req is not None
             is_prompt = seq_group_metadata_list[0].is_prompt
+            use_speculate = execute_model_req.use_speculate
             num_seq_groups = len(seq_group_metadata_list)
             blocks_to_swap_in = execute_model_req.blocks_to_swap_in
             blocks_to_swap_out = execute_model_req.blocks_to_swap_out
@@ -291,7 +289,8 @@ class Worker(WorkerBase):
 
         if use_speculate:
             output = self.model_runner.speculate_execute_model(
-                seq_group_metadata_list, is_prompt, self.gpu_cache, self.d_gpu_cache)
+                seq_group_metadata_list, is_prompt, self.gpu_cache,
+                self.d_gpu_cache)
         else:
             output = self.model_runner.execute_model(seq_group_metadata_list,
                                                      self.gpu_cache)
@@ -320,13 +319,12 @@ class Worker(WorkerBase):
     def get_cache_block_size_bytes(self) -> int:
         """Get the size of the KV cache block size in bytes.
         """
-        cache_block_size = CacheEngine.get_cache_block_size(self.cache_config,
-                                                self.model_config,
-                                                self.parallel_config)
+        cache_block_size = CacheEngine.get_cache_block_size(
+            self.cache_config, self.model_config, self.parallel_config)
         if self.use_speculate:
-            cache_block_size += CacheEngine.get_cache_block_size(self.cache_config,
-                                                self.draft_model_config,
-                                                self.parallel_config)
+            cache_block_size += CacheEngine.get_cache_block_size(
+                self.cache_config, self.draft_model_config,
+                self.parallel_config)
         return cache_block_size
 
 
@@ -340,9 +338,11 @@ def init_worker_distributed_environment(
     init_distributed_environment(parallel_config.world_size, rank,
                                  distributed_init_method, local_rank)
 
-    # TODO: set draft model tp
-    ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
-                                      parallel_config.pipeline_parallel_size,)
+    ensure_model_parallel_initialized(
+        parallel_config.tensor_parallel_size,
+        parallel_config.pipeline_parallel_size,
+        draft_model_tp_size=parallel_config.draft_model_tp_size,
+    )
 
     if pynccl_utils.is_initialized():
         pynccl_world_size = pynccl_utils.get_world_size()

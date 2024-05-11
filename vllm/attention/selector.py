@@ -53,6 +53,7 @@ def get_attn_backend(dtype: torch.dtype) -> Type[AttentionBackend]:
     else:
         raise ValueError("Invalid attention backend.")
 
+
 def _which_attn_to_use(dtype: torch.dtype) -> _Backend:
     """Returns which flash attention backend to use."""
     if is_cpu():

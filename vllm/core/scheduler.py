@@ -6,7 +6,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Deque, Dict, Iterable, List, Optional, Set, Tuple, Union
 
-from vllm.config import CacheConfig, LoRAConfig, SchedulerConfig, SpeculateConfig
+from vllm.config import CacheConfig, LoRAConfig, SchedulerConfig
 from vllm.core.interfaces import AllocStatus, BlockSpaceManager
 from vllm.core.policy import Policy, PolicyFactory
 from vllm.logger import init_logger
@@ -256,7 +256,6 @@ class Scheduler:
         scheduler_config: SchedulerConfig,
         cache_config: CacheConfig,
         lora_config: Optional[LoRAConfig],
-        speculate_config: Optional[SpeculateConfig],
     ) -> None:
         self.scheduler_config = scheduler_config
         self.cache_config = cache_config
@@ -264,9 +263,6 @@ class Scheduler:
         # simple and NOT fair. It can lead to starvation of some
         # LoRAs. This should be improved in the future.
         self.lora_config = lora_config
-        self.use_speculate = speculate_config is not None
-        if self.use_speculate:
-            self.speculate_length = speculate_config.speculate_length
 
         if self.scheduler_config.chunked_prefill_enabled:
             self.prompt_limit = self.scheduler_config.max_model_len
@@ -275,11 +271,6 @@ class Scheduler:
                 self.scheduler_config.max_model_len,
                 self.scheduler_config.max_num_batched_tokens)
 
-        if self.use_speculate:
-            assert not self.scheduler_config.use_v2_block_manager, \
-                "Speculative decoding does not support v2 block manager"
-            assert not self.cache_config.enable_prefix_caching, \
-                "Speculative decoding does not support prefix caching"
         BlockSpaceManagerImpl = BlockSpaceManager.get_block_space_manager_class(
             version="v2" if self.scheduler_config.
             use_v2_block_manager else "v1")
@@ -1021,7 +1012,6 @@ class Scheduler:
         self,
         seq_group: SequenceGroup,
         blocks_to_copy: Dict[int, List[int]],
-        num_new_tokens: int = 1,
     ) -> None:
         """Appends new slots to the sequences in the given sequence group.
 
