@@ -95,6 +95,9 @@ class Worker(WorkerBase):
         # Cache engine of draft model for speculative decoding.
         self.d_cache_engine = None
         self.d_gpu_cache = None
+        self.use_speculate = speculative_config is not None
+        if self.use_speculate:
+            self.draft_model_config = speculative_config.draft_model_config
 
     def init_device(self) -> None:
         if self.device_config.device.type == "cuda":
@@ -213,7 +216,7 @@ class Worker(WorkerBase):
         self.cache_engine = CacheEngine(self.cache_config, self.model_config,
                                         self.parallel_config)
         self.gpu_cache = self.cache_engine.gpu_cache
-        self.model_runner.set_block_size(self.cache_engine.block_size)
+        # self.model_runner.set_block_size(self.cache_engine.block_size)
         # Init cache engine for draft model when using speculative decoding.
         if self.use_speculate:
             self.d_cache_engine = CacheEngine(
@@ -275,6 +278,7 @@ class Worker(WorkerBase):
             return []
 
         seq_group_metadata_list = execute_model_req.seq_group_metadata_list
+        is_prompt = seq_group_metadata_list[0].is_prompt
         num_seq_groups = len(seq_group_metadata_list)
         # `blocks_to_swap_in` and `blocks_to_swap_out` are cpu tensors.
         # they contain parameters to launch cudamemcpyasync.
@@ -295,6 +299,7 @@ class Worker(WorkerBase):
             "blocks_to_swap_in": blocks_to_swap_in,
             "blocks_to_swap_out": blocks_to_swap_out,
             "blocks_to_copy": blocks_to_copy,
+            "is_prompt": is_prompt,
         }
         broadcast_tensor_dict(data, src=0)
 
@@ -304,7 +309,7 @@ class Worker(WorkerBase):
         if num_seq_groups == 0:
             return []
 
-        if use_speculate:
+        if self.use_speculate:
             output = self.model_runner.speculate_execute_model(
                 seq_group_metadata_list, is_prompt, self.gpu_cache,
                 self.d_gpu_cache)
@@ -340,6 +345,7 @@ class Worker(WorkerBase):
         blocks_to_swap_in = data.get("blocks_to_swap_in")
         blocks_to_swap_out = data.get("blocks_to_swap_out")
         blocks_to_copy = data.get("blocks_to_copy")
+        is_prompt = data.get("is_prompt")
         self.cache_swap(blocks_to_swap_in, blocks_to_swap_out, blocks_to_copy)
 
         # If there is no input, we don't need to execute the model.
@@ -347,6 +353,12 @@ class Worker(WorkerBase):
             return False
 
         self.model_runner.execute_model(None, self.gpu_cache)
+        if self.use_speculate:
+            self.model_runner.speculate_execute_model(None, is_prompt,
+                                                      self.gpu_cache,
+                                                      self.d_gpu_cache)
+        else:
+            self.model_runner.execute_model(None, self.gpu_cache)
         return True
 
     def add_lora(self, lora_request: LoRARequest) -> bool:

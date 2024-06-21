@@ -81,7 +81,7 @@ class SpeculateAttnImpl(FlashAttentionImpl):
                 key_cache,
                 value_cache,
                 attn_metadata.slot_mapping.flatten(),
-                attn_metadata.kv_cache_dtype,
+                self.kv_cache_dtype,
             )
         num_prefill_tokens = attn_metadata.num_prefill_tokens
         num_decode_tokens = attn_metadata.num_decode_tokens
@@ -96,8 +96,8 @@ class SpeculateAttnImpl(FlashAttentionImpl):
                 v=value,
                 cu_seqlens_q=prefill_meta.seq_start_loc,
                 cu_seqlens_k=prefill_meta.seq_start_loc,
-                max_seqlen_q=prefill_meta.max_seq_len,
-                max_seqlen_k=prefill_meta.max_seq_len,
+                max_seqlen_q=prefill_meta.max_prefill_seq_len,
+                max_seqlen_k=prefill_meta.max_prefill_seq_len,
                 softmax_scale=self.scale,
                 causal=True,
                 window_size=self.sliding_window,
@@ -109,7 +109,7 @@ class SpeculateAttnImpl(FlashAttentionImpl):
             decode_meta = attn_metadata.decode_metadata
             assert decode_meta.seq_lens_tensor is not None
             num_tokens = query.shape[0]
-            seq_len = getattr(decode_meta, "seq_len", 1)
+            seq_len = getattr(attn_metadata, "seq_len", 1)
             batch_size = num_tokens // seq_len
             # Run multi-query attention.
             output = flash_attn_with_kvcache(

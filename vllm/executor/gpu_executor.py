@@ -46,7 +46,6 @@ class GPUExecutor(ExecutorBase):
             vision_language_config=self.vision_language_config,
             speculative_config=self.speculative_config,
             is_driver_worker=rank == 0,
-            speculative_config=self.speculative_config,
         )
 
     def _create_worker(self,
@@ -54,12 +53,12 @@ class GPUExecutor(ExecutorBase):
                        rank: int = 0,
                        distributed_init_method: Optional[str] = None):
 
-        if self.speculative_config is None:
-            worker_module_name = "vllm.worker.worker"
-            worker_class_name = "Worker"
-        else:
-            worker_module_name = "vllm.spec_decode.spec_decode_worker"
-            worker_class_name = "create_spec_worker"
+        # if self.speculative_config is None:
+        worker_module_name = "vllm.worker.worker"
+        worker_class_name = "Worker"
+        # else:
+        #     worker_module_name = "vllm.spec_decode.spec_decode_worker"
+        #     worker_class_name = "create_spec_worker"
 
         wrapper = WorkerWrapperBase(
             worker_module_name=worker_module_name,
