@@ -38,6 +38,7 @@ from vllm.logger import init_logger
 class GraphCaptureContext:
     stream: torch.cuda.Stream
 
+
 class ActiveModel(enum.Enum):
     TARGET = enum.auto()
     DRAFT = enum.auto()
@@ -45,6 +46,26 @@ class ActiveModel(enum.Enum):
 
 # Draft model tensor parallel size for speculative decoding
 _DRAFT_MODEL_TP_SIZE = None
+
+_ACTIVE_MODEL: ActiveModel = ActiveModel.TARGET
+
+
+# This context manager is used to mark which model
+# is currently active so that the corresponding distributed group can be selected.
+@contextlib.contextmanager
+def MarkActiveModel(new_value):
+    global _ACTIVE_MODEL
+
+    # Save the original value
+    original_value = _ACTIVE_MODEL
+
+    try:
+        # Temporarily change the global variable
+        _ACTIVE_MODEL = new_value
+        yield
+    finally:
+        # Restore the original value after the block
+        _ACTIVE_MODEL = original_value
 
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
@@ -472,9 +493,14 @@ def get_world_group() -> GroupCoordinator:
 
 
 _TP: Optional[GroupCoordinator] = None
+_DRAFT_TP: Optional[GroupCoordinator] = None
 
 
 def get_tp_group() -> GroupCoordinator:
+    if _ACTIVE_MODEL == ActiveModel.DRAFT:
+        assert _DRAFT_TP is not None, (
+            "tensor model parallel group is not initialized")
+        return _DRAFT_TP
     assert _TP is not None, ("tensor model parallel group is not initialized")
     return _TP
 
@@ -571,27 +597,6 @@ def init_distributed_environment(
             "world group already initialized with a different world size")
 
 
-_ACTIVE_MODEL: ActiveModel = ActiveModel.TARGET
-
-
-# This context manager is used to mark which model
-# is currently active so that the corresponding distributed group can be selected.
-@contextlib.contextmanager
-def MarkActiveModel(new_value):
-    global _ACTIVE_MODEL
-
-    # Save the original value
-    original_value = _ACTIVE_MODEL
-
-    try:
-        # Temporarily change the global variable
-        _ACTIVE_MODEL = new_value
-        yield
-    finally:
-        # Restore the original value after the block
-        _ACTIVE_MODEL = original_value
-
-
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
@@ -652,6 +657,24 @@ def initialize_model_parallel(
         use_custom_allreduce=_ENABLE_CUSTOM_ALL_REDUCE,
     )
 
+    num_draft_model_tp_groups: int = (world_size //
+                                             draft_model_tp_size)
+    global _DRAFT_TP
+    assert _DRAFT_TP is None, ("tensor model parallel group is already initialized")
+    group_ranks = []
+    for i in range(num_draft_model_tp_groups):
+        ranks = list(
+            range(i * draft_model_tp_size,
+                  (i + 1) * draft_model_tp_size))
+        group_ranks.append(ranks)
+    _DRAFT_TP = GroupCoordinator(
+        group_ranks=group_ranks,
+        local_rank=get_world_group().local_rank,
+        torch_distributed_backend=backend,
+        use_pynccl=True,
+        use_custom_allreduce=_ENABLE_CUSTOM_ALL_REDUCE,
+    )
+
     # Build the pipeline model-parallel groups.
     num_pipeline_model_parallel_groups: int = (world_size //
                                                pipeline_model_parallel_size)
@@ -669,10 +692,6 @@ def initialize_model_parallel(
         use_pynccl=True,
         use_custom_allreduce=_ENABLE_CUSTOM_ALL_REDUCE,
     )
-
-    global _DRAFT_MODEL_TP_SIZE
-    assert _DRAFT_MODEL_TP_SIZE is None, ("draft model tp size is already set")
-    _DRAFT_MODEL_TP_SIZE = draft_model_tp_size
 
 
 def ensure_model_parallel_initialized(
@@ -717,12 +736,6 @@ def get_tensor_model_parallel_world_size():
         return _DRAFT_MODEL_TP_SIZE
     return torch.distributed.get_world_size(
         group=get_tensor_model_parallel_group())
-
-
-def get_pipeline_model_parallel_world_size():
-    """Return world size for the pipeline model parallel group."""
-    return torch.distributed.get_world_size(
-        group=get_pipeline_model_parallel_group())
 
 
 def get_tensor_model_parallel_rank():
