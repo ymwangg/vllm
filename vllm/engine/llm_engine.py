@@ -30,7 +30,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.sequence import (EmbeddingSequenceGroupOutput, ExecuteModelRequest,
                            PoolerOutput, SamplerOutput, Sequence,
                            SequenceGroup, SequenceGroupMetadata,
-                           SequenceStatus,  SpeculateOutput,
+                           SequenceStatus, SpeculateOutput,
                            SpeculateSequenceGroupOutput)
 from vllm.transformers_utils.detokenizer import Detokenizer, speculate_detokenize_incrementally
 from vllm.transformers_utils.tokenizer_group import (BaseTokenizerGroup,

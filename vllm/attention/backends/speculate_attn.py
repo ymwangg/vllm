@@ -53,8 +53,8 @@ class SpeculateAttnImpl(FlashAttentionImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         kv_cache: torch.Tensor,
-        attn_metadata: SpeculateAttnMetadata,
-        kv_scale: float,
+        attn_metadata: FlashAttentionMetadata,
+        kv_scale: float = 1.0,
     ) -> torch.Tensor:
         """Forward pass with FlashAttention and PagedAttention.
 
@@ -103,10 +103,10 @@ class SpeculateAttnImpl(FlashAttentionImpl):
                 window_size=self.sliding_window,
                 alibi_slopes=self.alibi_slopes,
             )
-        else:
+
+        if decode_meta := attn_metadata.decode_metadata:
             assert num_prefill_tokens == 0, "Mixing prefill and decode is not allowed"
             assert len(query.shape) == 3
-            decode_meta = attn_metadata.decode_metadata
             assert decode_meta.seq_lens_tensor is not None
             num_tokens = query.shape[0]
             seq_len = getattr(attn_metadata, "seq_len", 1)

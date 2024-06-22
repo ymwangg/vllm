@@ -952,6 +952,7 @@ class SpeculateSequenceOutput:
                 f"output_tokens={self.output_tokens}, "
                 f"logprobs_list={self.logprobs_list})")
 
+
 # For each sequence group, we generate a list of SequenceOutput object,
 # each of which contains one possible candidate for the next token.
 SpeculateOutput = List[SpeculateSequenceGroupOutput]

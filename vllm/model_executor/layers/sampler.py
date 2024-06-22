@@ -12,7 +12,8 @@ from vllm.model_executor.sampling_metadata import (SamplingMetadata,
 from vllm.sampling_params import SamplingType
 from vllm.sequence import (CompletionSequenceGroupOutput, Logprob,
                            PromptLogprobs, SampleLogprobs, SamplerOutput,
-                           SequenceOutput, SpeculateSequenceOutput, SpeculateSamplerOutput)
+                           SequenceOutput, SpeculateSequenceOutput,
+                           SpeculateSamplerOutput)
 
 # (num_token_ids, num_parent_ids) per sequence group.
 SampleResultType = List[Tuple[List[int], List[int]]]
@@ -1190,6 +1191,7 @@ def _get_next_prompt_tokens(seq_group: SequenceGroupToSample) -> List[int]:
     next_prompt_tokens = prompt_tokens[
         next_token_index_start:next_token_index_end]
     return next_prompt_tokens
+
 
 def _reject_sample(
     target_logits: torch.Tensor,

@@ -657,23 +657,23 @@ def initialize_model_parallel(
         use_custom_allreduce=_ENABLE_CUSTOM_ALL_REDUCE,
     )
 
-    num_draft_model_tp_groups: int = (world_size //
-                                             draft_model_tp_size)
-    global _DRAFT_TP
-    assert _DRAFT_TP is None, ("tensor model parallel group is already initialized")
-    group_ranks = []
-    for i in range(num_draft_model_tp_groups):
-        ranks = list(
-            range(i * draft_model_tp_size,
-                  (i + 1) * draft_model_tp_size))
-        group_ranks.append(ranks)
-    _DRAFT_TP = GroupCoordinator(
-        group_ranks=group_ranks,
-        local_rank=get_world_group().local_rank,
-        torch_distributed_backend=backend,
-        use_pynccl=True,
-        use_custom_allreduce=_ENABLE_CUSTOM_ALL_REDUCE,
-    )
+    if draft_model_tp_size:
+        num_draft_model_tp_groups: int = (world_size // draft_model_tp_size)
+        global _DRAFT_TP
+        assert _DRAFT_TP is None, (
+            "tensor model parallel group is already initialized")
+        group_ranks = []
+        for i in range(num_draft_model_tp_groups):
+            ranks = list(
+                range(i * draft_model_tp_size, (i + 1) * draft_model_tp_size))
+            group_ranks.append(ranks)
+        _DRAFT_TP = GroupCoordinator(
+            group_ranks=group_ranks,
+            local_rank=get_world_group().local_rank,
+            torch_distributed_backend=backend,
+            use_pynccl=True,
+            use_custom_allreduce=_ENABLE_CUSTOM_ALL_REDUCE,
+        )
 
     # Build the pipeline model-parallel groups.
     num_pipeline_model_parallel_groups: int = (world_size //
@@ -732,18 +732,11 @@ def model_parallel_is_initialized():
 def get_tensor_model_parallel_world_size():
     """Return world size for the tensor model parallel group."""
     return get_tp_group().world_size
-    if _ACTIVE_MODEL == ActiveModel.DRAFT:
-        return _DRAFT_MODEL_TP_SIZE
-    return torch.distributed.get_world_size(
-        group=get_tensor_model_parallel_group())
 
 
 def get_tensor_model_parallel_rank():
     """Return my rank for the tensor model parallel group."""
     return get_tp_group().rank_in_group
-    if _ACTIVE_MODEL == ActiveModel.DRAFT and _DRAFT_MODEL_TP_SIZE == 1:
-        return 0
-    return torch.distributed.get_rank(group=get_tensor_model_parallel_group())
 
 
 def destroy_model_parallel():
@@ -757,6 +750,11 @@ def destroy_model_parallel():
     if _PP:
         _PP.destroy()
     _PP = None
+
+    global _DRAFT_TP
+    if _DRAFT_TP:
+        _DRAFT_TP.destroy()
+    _DRAFT_TP = None
 
 
 def destroy_distributed_environment():

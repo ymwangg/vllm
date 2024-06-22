@@ -352,7 +352,6 @@ class Worker(WorkerBase):
         if num_seq_groups == 0:
             return False
 
-        self.model_runner.execute_model(None, self.gpu_cache)
         if self.use_speculate:
             self.model_runner.speculate_execute_model(None, is_prompt,
                                                       self.gpu_cache,

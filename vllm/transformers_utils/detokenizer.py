@@ -312,6 +312,7 @@ def detokenize_incrementally(
     new_text = new_text[len(prefix_text):]
     return new_tokens, new_text, read_offset, len(output_tokens)
 
+
 # Based on
 # https://github.com/huggingface/text-generation-inference/blob/v0.9.4/server/text_generation_server/models/model.py#L62C9-L62C15
 # under Apache 2.0 license
