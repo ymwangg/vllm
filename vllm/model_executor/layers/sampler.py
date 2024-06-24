@@ -102,11 +102,10 @@ class Sampler(nn.Module):
             # Compute the probabilities.
             probs = torch.softmax(logits, dim=-1, dtype=torch.float)
             # Compute the log probabilities.
-            logprobs = torch.exp(probs)
-            # logprobs = torch.log_softmax(logits, dim=-1, dtype=torch.float)
+            logprobs = torch.log_softmax(logits, dim=-1, dtype=torch.float)
             # Run rejection sampling algorithm in speculative decoding.
             sampled_token_ids, num_accepted = _reject_sample(
-                probs, logits, sampling_metadata, do_greedy,
+                probs, logprobs, sampling_metadata, do_greedy,
                 sampling_tensors.greedy_flags)
             out = _build_reject_sampler_output(logprobs, sampling_metadata,
                                                sampled_token_ids, num_accepted)
@@ -1194,8 +1193,8 @@ def _get_next_prompt_tokens(seq_group: SequenceGroupToSample) -> List[int]:
 
 
 def _reject_sample(
-    target_logits: torch.Tensor,
     target_token_probs: torch.Tensor,
+    target_token_logprobs: torch.Tensor,
     sampling_metadata: SamplingMetadata,
     do_greedy: bool = False,
     greedy_flags: Optional[torch.Tensor] = None,
@@ -1226,7 +1225,7 @@ def _reject_sample(
         assert greedy_flags is not None
         num_draft_tokens = draft_token_ids.shape[-1]
         is_greedy_match = torch.argmax(
-            target_logits, -1)[:, :num_draft_tokens] == draft_token_ids
+            target_token_logprobs, -1)[:, :num_draft_tokens] == draft_token_ids
         is_match = torch.where(
             greedy_flags[:, None].expand(-1, num_draft_tokens),
             is_greedy_match, is_match)
@@ -1249,7 +1248,8 @@ def _reject_sample(
     sampled_token_ids = _multinomial(probs, 1).squeeze(-1)
     if do_greedy:
         # Special treatment for greedy sampling
-        logprobs = torch.gather(target_logits, 1, gather_indices).squeeze(1)
+        logprobs = torch.gather(target_token_logprobs, 1,
+                                gather_indices).squeeze(1)
         greedy_sampled_token_ids = torch.argmax(logprobs, dim=-1)
         sampled_token_ids = torch.where(greedy_flags, greedy_sampled_token_ids,
                                         sampled_token_ids)
