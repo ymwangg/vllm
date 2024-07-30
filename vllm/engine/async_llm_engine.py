@@ -237,12 +237,19 @@ class _AsyncLLMEngine(LLMEngine):
         else:
             output = []
 
-        request_outputs = self._process_model_outputs(
-            output, scheduler_outputs.scheduled_seq_groups,
-            scheduler_outputs.ignored_seq_groups, seq_group_metadata_list)
+        if self.use_speculate:
+            if output:
+                request_outputs = self._process_model_outputs_old(
+                    output[0], scheduler_outputs)
+            else:
+                return []
+        else:
+            request_outputs = self._process_model_outputs(
+                output, scheduler_outputs.scheduled_seq_groups,
+                scheduler_outputs.ignored_seq_groups, seq_group_metadata_list)
 
         # Log stats.
-        self.do_log_stats(scheduler_outputs, output)
+        # self.do_log_stats(scheduler_outputs, output)
 
         if not request_outputs:
             # Stop the execute model loop in parallel workers until there are
